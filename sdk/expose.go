@@ -46,14 +46,23 @@ const (
 
 // RelayStatus is an immutable snapshot of one relay's externally visible state.
 type RelayStatus struct {
-	RelayURL  string
+	RelayURL string
+	// PublicURL is the identity-bound canonical URL. It always routes to
+	// this exposure, and the opt-in relay cache serves only this hostname.
 	PublicURL string
-	UDPAddr   string
-	TCPAddr   string
-	Version   string
-	State     RelayState
-	Failure   RelayFailure
-	Err       error
+	// AliasURL is the <name>.<root host> URL when the relay granted that
+	// alias to this lease, else empty: another identity may own the name
+	// (canonical fallback). The relay holds the alias only while the lease
+	// lives: it stays set while the lease is held (also RelayConnecting while
+	// reverse sessions reconnect) and is cleared on RelayFailed. Show it only
+	// while State is RelayReady. It always reaches the live origin.
+	AliasURL string
+	UDPAddr  string
+	TCPAddr  string
+	Version  string
+	State    RelayState
+	Failure  RelayFailure
+	Err      error
 	// Deselected marks a best-effort removal notification, never a stored
 	// snapshot: the relay left the desired membership set (discovery
 	// deselection or a relay-list change) and the endpoint fields carry
@@ -598,13 +607,20 @@ func (e *Exposure) applyRelayStatus(relayURL string, update listenerStatus, owne
 	} else if update.state != RelayFailed {
 		status.Err = nil
 	}
+	if update.state == RelayFailed {
+		// The lease may be gone, and another identity can then take the
+		// alias; a stale AliasURL would open someone else's service.
+		status.AliasURL = ""
+	}
 	if update.state == RelayConnecting {
 		status.PublicURL = ""
+		status.AliasURL = ""
 		status.UDPAddr = ""
 		status.TCPAddr = ""
 	}
 	if update.publicURL != "" || update.state == RelayReady {
 		status.PublicURL = update.publicURL
+		status.AliasURL = update.aliasURL
 	}
 	if update.udpAddr != "" || update.state == RelayConnecting || update.state == RelayReady {
 		status.UDPAddr = update.udpAddr
@@ -698,6 +714,7 @@ func relayStatusEqual(a, b RelayStatus) bool {
 	}
 	return a.RelayURL == b.RelayURL &&
 		a.PublicURL == b.PublicURL &&
+		a.AliasURL == b.AliasURL &&
 		a.UDPAddr == b.UDPAddr &&
 		a.TCPAddr == b.TCPAddr &&
 		a.Version == b.Version &&
@@ -736,6 +753,7 @@ func (e *Exposure) syncRelayStatuses(relayURLs []string) []RelayStatus {
 	for relayURL, status := range desired {
 		if current, ok := e.statuses[relayURL]; ok {
 			status.PublicURL = current.PublicURL
+			status.AliasURL = current.AliasURL
 			status.UDPAddr = current.UDPAddr
 			status.TCPAddr = current.TCPAddr
 			status.Version = current.Version

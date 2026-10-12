@@ -68,6 +68,75 @@ func TestExposureWaitReadyUsesRelayStatus(t *testing.T) {
 	}
 }
 
+func TestRelayStatusReportsGrantedAliasURL(t *testing.T) {
+	const (
+		relayURL     = "https://relay.example"
+		canonicalURL = "https://demo-0123456789abcdef0123456789abcdef01234567.relay.example:443"
+		aliasURL     = "https://demo.relay.example:443"
+	)
+	exposure := newExposureStateTest(t, relayURL)
+	status := func() RelayStatus {
+		t.Helper()
+		relays := exposure.Relays()
+		if len(relays) != 1 {
+			t.Fatalf("Relays() = %+v, want one relay", relays)
+		}
+		return relays[0]
+	}
+
+	exposure.setRelayStatus(relayURL, listenerStatus{state: RelayReady, publicURL: canonicalURL, aliasURL: aliasURL})
+	if got := status(); got.PublicURL != canonicalURL || got.AliasURL != aliasURL {
+		t.Fatalf("granted alias: PublicURL=%q AliasURL=%q", got.PublicURL, got.AliasURL)
+	}
+
+	// A membership re-sync keeps the reported alias.
+	exposure.syncRelayStatuses([]string{relayURL})
+	if got := status(); got.AliasURL != aliasURL {
+		t.Fatalf("after re-sync: AliasURL=%q, want %q", got.AliasURL, aliasURL)
+	}
+
+	// A failure keeps the canonical URL but drops the alias, which the
+	// relay may have handed to another identity.
+	exposure.setRelayStatus(relayURL, listenerStatus{state: RelayFailed, failure: RelayFailureRuntime, err: errors.New("lease lost")})
+	if got := status(); got.PublicURL != canonicalURL || got.AliasURL != "" {
+		t.Fatalf("failed: PublicURL=%q AliasURL=%q", got.PublicURL, got.AliasURL)
+	}
+
+	// Re-registration clears both URLs until the relay answers again.
+	exposure.setRelayStatus(relayURL, listenerStatus{state: RelayConnecting})
+	if got := status(); got.PublicURL != "" || got.AliasURL != "" {
+		t.Fatalf("connecting: PublicURL=%q AliasURL=%q, want both empty", got.PublicURL, got.AliasURL)
+	}
+
+	// Canonical fallback: another identity owns the friendly name.
+	exposure.setRelayStatus(relayURL, listenerStatus{state: RelayReady, publicURL: canonicalURL})
+	if got := status(); got.PublicURL != canonicalURL || got.AliasURL != "" {
+		t.Fatalf("canonical fallback: PublicURL=%q AliasURL=%q", got.PublicURL, got.AliasURL)
+	}
+}
+
+func TestAliasURLForLeaseRequiresGrantedAlias(t *testing.T) {
+	t.Parallel()
+
+	relayURL, err := url.Parse("https://relay.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &listener{api: &apiClient{relayURL: relayURL}}
+	const canonical = "demo-0123456789abcdef0123456789abcdef01234567.relay.example.com"
+
+	granted := listenerSnapshot{hostname: canonical, aliasHostname: "demo.relay.example.com"}
+	if got, want := l.aliasURLForLease(granted), "https://demo.relay.example.com:443"; got != want {
+		t.Fatalf("aliasURLForLease(granted) = %q, want %q", got, want)
+	}
+	if got, want := l.publicURLForLease(granted), "https://"+canonical+":443"; got != want {
+		t.Fatalf("publicURLForLease(granted) = %q, want canonical %q", got, want)
+	}
+	if got := l.aliasURLForLease(listenerSnapshot{hostname: canonical}); got != "" {
+		t.Fatalf("aliasURLForLease(fallback) = %q, want empty", got)
+	}
+}
+
 func TestPublicURLForLeaseUsesRelayAuthority(t *testing.T) {
 	t.Parallel()
 
