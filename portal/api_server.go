@@ -564,6 +564,11 @@ func (s *Server) HandleConnect(w http.ResponseWriter, r *http.Request, sourceAdd
 func (s *Server) HandleStaticCache(w http.ResponseWriter, req *http.Request) {
 	record, err := s.registry.admitLeaseByToken(req.Header.Get(types.HeaderAccessToken), false)
 	if err != nil {
+		// An unauthenticated streaming upload must not be drained after
+		// its error response. Valid uploads have cache-owned deadlines.
+		if req.ProtoMajor == 1 {
+			w.Header().Set("Connection", "close")
+		}
 		writeAPIErrorResponse(w, err)
 		return
 	}
@@ -571,6 +576,9 @@ func (s *Server) HandleStaticCache(w http.ResponseWriter, req *http.Request) {
 	// here or invalidates this generation before cache publication.
 	generation := s.registry.cache.Generation(record.id)
 	if !s.registry.isRoutable(record.ServiceKey()) {
+		if req.ProtoMajor == 1 {
+			w.Header().Set("Connection", "close")
+		}
 		writeAPIErrorResponse(w, errLeaseRejected)
 		return
 	}
