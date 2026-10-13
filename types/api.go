@@ -239,6 +239,11 @@ type PolicySettings struct {
 	TCPPort            PolicyPortSettings `json:"tcp_port"`
 }
 
+// LeaseEvictRequest identifies a live lease to remove without changing policy.
+type LeaseEvictRequest struct {
+	IdentityKey string `json:"identity_key"`
+}
+
 type LeasePolicyUpdate struct {
 	IdentityKey string `json:"identity_key"`
 	BPS         *int64 `json:"bps,omitempty"`
