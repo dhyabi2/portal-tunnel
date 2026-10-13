@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -222,7 +223,7 @@ func DecodeAPIRequestError(resp *http.Response) error {
 func DecodeJSONRequest[T any](w http.ResponseWriter, r *http.Request, maxBytes int64) (T, bool) {
 	dst, err := decodeJSONRequestBody[T](w, r, maxBytes)
 	if err != nil {
-		if writeRequestBodyTooLarge(w, err) {
+		if writeRequestBodyTooLarge(w, err) || writeRequestBodyTimeout(w, r, err) {
 			return dst, false
 		}
 		WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidJSON, err.Error())
@@ -234,7 +235,7 @@ func DecodeJSONRequest[T any](w http.ResponseWriter, r *http.Request, maxBytes i
 func DecodeJSONRequestAs[T any](w http.ResponseWriter, r *http.Request, maxBytes int64, invalid APIErrorResponse) (T, bool) {
 	dst, err := decodeJSONRequestBody[T](w, r, maxBytes)
 	if err != nil {
-		if writeRequestBodyTooLarge(w, err) {
+		if writeRequestBodyTooLarge(w, err) || writeRequestBodyTimeout(w, r, err) {
 			return dst, false
 		}
 		invalid.Write(w)
@@ -259,6 +260,19 @@ func decodeJSONRequestBody[T any](w http.ResponseWriter, r *http.Request, maxByt
 		return dst, err
 	}
 	return dst, nil
+}
+
+// A timed-out HTTP/1 body must not be drained again for connection reuse.
+func writeRequestBodyTimeout(w http.ResponseWriter, r *http.Request, err error) bool {
+	var timeout net.Error
+	if !errors.As(err, &timeout) || !timeout.Timeout() {
+		return false
+	}
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "close")
+	}
+	WriteAPIError(w, http.StatusRequestTimeout, types.APIErrorCodeInvalidRequest, "request body timed out")
+	return true
 }
 
 func writeRequestBodyTooLarge(w http.ResponseWriter, err error) bool {
