@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -38,12 +39,43 @@ type QUICBackhaulControl struct {
 	stream      *quic.Stream
 }
 
-func ListenQUICBackhaul(addr string, cert tls.Certificate) (*quic.Listener, error) {
-	listener, err := quic.ListenAddr(addr, quicBackhaulServerTLSConfig(cert), quicBackhaulConfig())
+// QUICBackhaulListener owns both its UDP socket and the QUIC transport.
+type QUICBackhaulListener struct {
+	*quic.Listener
+	transport *quic.Transport
+	socket    *net.UDPConn
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func ListenQUICBackhaul(addr string, cert tls.Certificate) (*QUICBackhaulListener, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve quic backhaul address: %w", err)
+	}
+	socket, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen quic backhaul: %w", err)
 	}
-	return listener, nil
+	quicTransport := &quic.Transport{
+		Conn: socket,
+		// Verify ownership of the claimed source before spending handshake work.
+		VerifySourceAddress: func(net.Addr) bool { return true },
+	}
+	listener, err := quicTransport.Listen(quicBackhaulServerTLSConfig(cert), quicBackhaulConfig())
+	if err != nil {
+		_ = quicTransport.Close()
+		_ = socket.Close()
+		return nil, fmt.Errorf("listen quic backhaul: %w", err)
+	}
+	return &QUICBackhaulListener{Listener: listener, transport: quicTransport, socket: socket}, nil
+}
+
+func (l *QUICBackhaulListener) Close() error {
+	l.closeOnce.Do(func() {
+		l.closeErr = errors.Join(l.Listener.Close(), l.transport.Close(), l.socket.Close())
+	})
+	return l.closeErr
 }
 
 func DialQUICBackhaul(ctx context.Context, addr string, tlsConfig *tls.Config, accessToken string) (*quic.Conn, error) {

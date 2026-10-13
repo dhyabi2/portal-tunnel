@@ -38,10 +38,10 @@ func TestQUICPendingAuthenticationBoundAndShutdown(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	// Keep the first 64 connections unauthenticated. Neither a silent peer
-	// nor a partially written credential may escape the same pending budget.
+	// One address may occupy only eight pending authentication slots. A silent
+	// peer and one with partial credentials consume the same source budget.
 	var peers []*quic.Conn
-	for i := 0; i < 65; i++ {
+	for i := 0; i < 9; i++ {
 		dialCtx, dialCancel := context.WithTimeout(ctx, 3*time.Second)
 		peer, err := quic.DialAddr(dialCtx, addr, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"portal-tunnel"}}, &quic.Config{EnableDatagrams: true})
 		dialCancel()
@@ -61,11 +61,11 @@ func TestQUICPendingAuthenticationBoundAndShutdown(t *testing.T) {
 		}
 	}
 	select {
-	case <-peers[64].Context().Done():
+	case <-peers[8].Context().Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("connection beyond pending-auth capacity remained open")
 	}
-	for _, peer := range peers[:64] {
+	for _, peer := range peers[:8] {
 		if err := peer.Context().Err(); err != nil {
 			t.Fatalf("connection within pending-auth capacity closed early: %v", context.Cause(peer.Context()))
 		}
@@ -78,7 +78,7 @@ func TestQUICPendingAuthenticationBoundAndShutdown(t *testing.T) {
 	if err := relay.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	for _, peer := range peers[:64] {
+	for _, peer := range peers[:8] {
 		select {
 		case <-peer.Context().Done():
 		case <-shutdownCtx.Done():

@@ -41,6 +41,8 @@ const (
 	quicBackhaulPendingLimit     = 64
 )
 
+const quicBackhaulAuthenticationTimeout = 3 * time.Second
+
 type ServerConfig struct {
 	Cache            cache.Config
 	IVNPConfigPath   string
@@ -201,7 +203,7 @@ type Server struct {
 	apiTLSClose      io.Closer
 	redirectListener net.Listener
 	redirectServer   *http.Server
-	quicBackhaul     *quic.Listener
+	quicBackhaul     *transport.QUICBackhaulListener
 	quicBackhaulDone chan struct{}
 
 	relaySet *discovery.RelaySet
@@ -363,7 +365,7 @@ func (s *Server) start(ctx context.Context, apiHandler http.Handler) error {
 	var apiCloser io.Closer
 	var redirectListener net.Listener
 	var redirectServer *http.Server
-	var quicBackhaul *quic.Listener
+	var quicBackhaul *transport.QUICBackhaulListener
 	defer func() {
 		if started {
 			return
@@ -919,7 +921,7 @@ func (s *Server) runRegistryJanitor(ctx context.Context, interval time.Duration)
 	}
 }
 
-func (s *Server) newQUICBackhaulListener(apiTLS *tls.Config) (*quic.Listener, error) {
+func (s *Server) newQUICBackhaulListener(apiTLS *tls.Config) (*transport.QUICBackhaulListener, error) {
 	if len(apiTLS.Certificates) == 0 {
 		return nil, fmt.Errorf("quic backhaul requires api tls certificate")
 	}
@@ -936,7 +938,7 @@ func (s *Server) runQUICBackhaulListener(ctx context.Context) error {
 		cancel()
 		handlers.Wait()
 	}()
-	pending := make(chan struct{}, quicBackhaulPendingLimit)
+	var admission quicBackhaulAdmission
 	for {
 		conn, err := s.quicBackhaul.Accept(ctx)
 		if err != nil {
@@ -945,17 +947,21 @@ func (s *Server) runQUICBackhaulListener(ctx context.Context) error {
 			}
 			return err
 		}
-		select {
-		case pending <- struct{}{}:
-			authCtx, authCancel := context.WithTimeout(ctx, defaultClaimTimeout)
-			handlers.Go(func() {
-				defer authCancel()
-				defer func() { <-pending }()
-				s.handleQUICBackhaulConn(authCtx, conn)
-			})
-		default:
+		authCtx, authCancel := context.WithTimeout(ctx, quicBackhaulAuthenticationTimeout)
+		slot, evict := admission.admit(quicBackhaulSource(conn.RemoteAddr()), authCancel)
+		if slot == nil {
+			authCancel()
 			_ = conn.CloseWithError(1, "backhaul authentication busy")
+			continue
 		}
+		if evict != nil {
+			evict()
+		}
+		handlers.Go(func() {
+			defer authCancel()
+			defer admission.release(slot)
+			s.handleQUICBackhaulConn(authCtx, conn)
+		})
 	}
 }
 
