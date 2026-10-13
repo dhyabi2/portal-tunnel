@@ -729,15 +729,7 @@ func (r *leaseRegistry) EvictLease(key types.ServiceIdentityKey) *leaseRecord {
 		r.bps.ResetIdentityLimiter(key)
 		r.mu.Unlock()
 
-		r.closeRecord(record)
-		r.mu.Lock()
-		if record.datagram != nil {
-			r.udpPorts.releaseImmediately(record.datagram.UDPPort(), record)
-		}
-		if record.tcpPort > 0 {
-			r.tcpPorts.releaseImmediately(record.tcpPort, record)
-		}
-		r.mu.Unlock()
+		r.closeRecordImmediately(record)
 		return record
 	}
 	r.mu.Unlock()
@@ -779,7 +771,7 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 		i++
 	}
 	if pendingTotal >= maxPendingRegisterChallenges {
-		return types.RegisterChallengeResponse{}, errRegisterChallengeCapacity
+		return types.RegisterChallengeResponse{}, errRegisterChallengeFull
 	}
 	if pending >= defaultRegisterChallengeOutstandingPerIP {
 		return types.RegisterChallengeResponse{}, errRegisterChallengePending
@@ -996,6 +988,23 @@ func (r *leaseRegistry) publicLease(record *leaseRecord) types.Lease {
 	return lease
 }
 
+// closeRecordImmediately skips the port grace period after administrative
+// eviction. Keep ownership until all sockets are closed.
+func (r *leaseRegistry) closeRecordImmediately(record *leaseRecord) {
+	if record == nil {
+		return
+	}
+	record.Close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if record.datagram != nil {
+		r.udpPorts.releaseImmediately(record.datagram.UDPPort(), record)
+	}
+	if record.tcpPort > 0 {
+		r.tcpPorts.releaseImmediately(record.tcpPort, record)
+	}
+}
+
 // closeRecord releases sockets before making their ports available for reuse.
 // Resource shutdown never holds the registry lock. The reservation owner check
 // makes repeated cleanup harmless even after a port has been reassigned.
@@ -1089,22 +1098,13 @@ func (a *portPool) release(port int, record *leaseRecord) {
 	a.cleanupExpired(time.Now())
 }
 
-// releaseImmediately clears the port's grace reservation after its socket is
-// closed. It never reclaims a port already reassigned to another lease.
+// releaseImmediately skips the grace period when the removed lease still
+// owns the port. Its socket must be closed first.
 func (a *portPool) releaseImmediately(port int, record *leaseRecord) {
-	if owner, ok := a.inUse[port]; ok {
-		if owner != record {
-			return
-		}
-		delete(a.inUse, port)
-	} else {
-		key := record.ServiceKey()
-		reservation, ok := a.reserved[key]
-		if !ok || reservation.port != port {
-			return
-		}
-		delete(a.reserved, key)
+	if a.inUse[port] != record {
+		return
 	}
+	delete(a.inUse, port)
 	a.sortedInsert(port)
 }
 
