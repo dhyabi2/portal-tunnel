@@ -53,21 +53,34 @@ func TestControlBodyGateBoundsActiveSourcesAndGlobalWork(t *testing.T) {
 	}
 }
 
-func TestControlBodyGuardKeepsStreamingCacheUploadsSeparate(t *testing.T) {
-	for _, method := range []string{http.MethodPost, http.MethodPut} {
-		req := httptest.NewRequest(method, types.PathSDKCache, strings.NewReader("{"))
-		if isControlBodyRequest(req) {
-			t.Fatalf("%s cache upload must use the cache-owned deadline", method)
-		}
-	}
-	for _, path := range []string{types.PathSDKRegister, types.PathSDKRenew, types.PathDiscoveryAnnounce, types.PathPolicy, types.PathV1Sign, types.PathSDKConnect, "/"} {
+func TestControlBodyGuardTargetsJSONControlRoutes(t *testing.T) {
+	for _, path := range []string{
+		types.PathSDKRegisterChallenge, types.PathSDKRegister, types.PathSDKRenew,
+		types.PathSDKReverse, types.PathSDKUnregister, types.PathDiscoveryAnnounce,
+		types.PathV1Sign, types.PathAdminAuthLogin, types.PathPolicy,
+		types.PathPolicyLeases, types.PathPolicy + "/",
+		types.PathAPIPrefix + "/reputation/vote", types.PathAPIPrefix + "/x402/verify",
+	} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
 		if !isControlBodyRequest(req) {
-			t.Fatalf("%s must bound a nonempty request body", path)
+			t.Errorf("POST %s was not bounded", path)
 		}
 	}
-	if isControlBodyRequest(httptest.NewRequest(http.MethodGet, types.PathSDKConnect, nil)) {
-		t.Fatal("reverse tunnel upgrade must not receive a body deadline")
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, types.PathSDKConnect},
+		{http.MethodPost, types.PathSDKConnect},
+		{http.MethodPost, types.PathSDKCache},
+		{http.MethodPut, types.PathSDKCache},
+		{http.MethodPost, "/application/upload"},
+		{http.MethodPost, "/api/unrecognized"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{"))
+		if isControlBodyRequest(req) {
+			t.Errorf("%s %s must not inherit JSON body deadlines", tc.method, tc.path)
+		}
+	}
+	if isControlBodyRequest(httptest.NewRequest(http.MethodPost, types.PathSDKRegister, nil)) {
+		t.Fatal("bodyless request must not occupy a body slot")
 	}
 }
 
@@ -112,7 +125,7 @@ func TestMuxRejectsActiveBodiesBeforeReadingMoreData(t *testing.T) {
 			t.Fatal(err)
 		}
 		connections = append(connections, conn)
-		if _, err := fmt.Fprint(conn, "POST /api/slow HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n{"); err != nil {
+		if _, err := fmt.Fprint(conn, "POST /api/reputation/vote HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n{"); err != nil {
 			t.Fatal(err)
 		}
 		select {
@@ -130,7 +143,7 @@ func TestMuxRejectsActiveBodiesBeforeReadingMoreData(t *testing.T) {
 	if err := extra.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fmt.Fprint(extra, "POST /api/slow HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n"); err != nil {
+	if _, err := fmt.Fprint(extra, "POST /api/reputation/vote HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	response, err := http.ReadResponse(bufio.NewReader(extra), &http.Request{Method: http.MethodPost})
@@ -166,7 +179,7 @@ func TestMuxClosesStalledJSONRequestAtBodyDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	if _, err := fmt.Fprint(conn, "POST /api/slow HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n{\"x\":\""); err != nil {
+	if _, err := fmt.Fprint(conn, "POST /api/reputation/vote HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n{\"x\":\""); err != nil {
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(conn)
