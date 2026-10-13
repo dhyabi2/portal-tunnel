@@ -51,25 +51,20 @@ func (g *controlBodyGate) release(source netip.Addr) {
 	}
 }
 
-// Bound control-plane bodies, including unauthenticated cache requests.
-// Cache uploads extend this deadline after authorization. Application-owned
-// streaming routes and valid bodyless reverse upgrades are unaffected.
+// Root-host control paths belong to the relay, including unknown methods and
+// paths. Guard their bodies before route dispatch so an attacker cannot bypass
+// the body limit through a non-JSON endpoint such as /api/healthz.
+// Application-owned routes outside the reserved prefixes are unaffected.
 func isControlBodyRequest(r *http.Request) bool {
 	if r.Body == nil || r.Body == http.NoBody {
 		return false
 	}
-	path := strings.TrimSuffix(r.URL.Path, "/")
-	switch path {
-	case types.PathSDKCache, types.PathSDKConnect,
-		types.PathSDKRegisterChallenge, types.PathSDKRegister,
-		types.PathSDKRenew, types.PathSDKReverse, types.PathSDKUnregister,
-		types.PathDiscoveryAnnounce, types.PathV1Sign,
-		types.PathAdminAuthLogin, types.PathPolicy, types.PathPolicyLeases:
-		return true
+	for _, prefix := range types.ReservedRootPrefixes {
+		if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix+"/") {
+			return true
+		}
 	}
-	return path == types.PathAPIPrefix+"/reputation/vote" ||
-		path == types.PathAPIPrefix+"/x402" ||
-		strings.HasPrefix(path, types.PathAPIPrefix+"/x402/")
+	return false
 }
 
 func (g *controlBodyGate) wrap(ingress *Ingress, next http.Handler) http.Handler {
