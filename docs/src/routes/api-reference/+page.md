@@ -42,7 +42,8 @@ The envelope does not apply to streaming or delegated endpoints:
 | `/sdk/connect` | HTTP/1.1 connection hijack |
 | `/v1/sign` | keyless TLS signer protocol |
 | `/api/x402/*` | relay-owned x402 facilitator response |
-| `/api/install.sh`, `/api/install.ps1`, `/api/install/bin/*` | script or binary bytes |
+| `/api/install.sh`, `/api/install.ps1` | retired install-script endpoints (HTTP 410 Gone) |
+| `/api/install/bin/*` | install assets (native binaries redirect to official publisher) |
 
 Unknown routes may be handled by the frontend fallback or return a normal
 HTTP 404 outside the envelope.
@@ -76,7 +77,7 @@ configured admin token.
 | `GET`/`HEAD` | `/llms.txt` | None | relay and tunnel connection guide |
 | `GET` | `/api/healthz` | None | `{ "status": "ok" }` |
 | `GET` | `/api/state` | None | `PublicStateResponse` |
-| `GET`/`HEAD` | `/api/install.sh`, `/api/install.ps1` | None | install script |
+| `GET`/`HEAD` | `/api/install.sh`, `/api/install.ps1` | None | `410 Gone`; install from official GitHub releases |
 | `GET`/`HEAD` | `/api/install/bin/{slug}` | None | install binary or redirect |
 
 Detailed contracts: [SDK API](/api-reference/sdk) and
