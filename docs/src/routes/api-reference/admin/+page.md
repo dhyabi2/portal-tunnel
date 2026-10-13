@@ -32,6 +32,7 @@ Admin bearer tokens are separate from SDK lease tokens.
 | `POST` | `/api/policy` | Bearer | `PolicySettings` | `PolicySettings` |
 | `GET` | `/api/policy/state` | Bearer | none | `PolicyStateResponse` |
 | `POST` | `/api/policy/leases` | Bearer | `LeasePolicyUpdate` | `{}` |
+| `POST` | `/api/policy/leases/evict` | Bearer | `LeaseEvictRequest` | `{}` |
 
 ## Auth Payloads
 
@@ -118,3 +119,10 @@ Supported modes:
 | `bps` | `number` | set bytes-per-second limit; `0` removes the limit |
 
 Lease policy updates persist to `policy.json` and return `{}` on success.
+
+To terminate a live lease immediately, send `POST /api/policy/leases/evict`
+with `{"identity_key":"name:address"}` and an admin bearer token. Eviction
+invalidates that lease's credentials, closes its active transports, frees its
+raw ports without a grace reservation, and removes its cache attachment and
+DNS mapping. It does not change the identity's persistent access policy.
+A missing lease returns HTTP 404.
