@@ -1,12 +1,15 @@
 package cache
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -352,21 +355,33 @@ func (r *gatedBody) Read(p []byte) (int, error) {
 }
 
 func TestAdmissionKeepsChecksAndUploadsIndependentlyBounded(t *testing.T) {
-	c := testManager(t, 32) // Cache owns a separate two-request pool for each operation.
+	c := testManager(t, 32) // Manifest checks and uploads have separate two-request pools.
 	l := testLease(c, "site")
+	other := testLease(c, "other")
 	resume := make(chan struct{})
 	var workers sync.WaitGroup
 	defer func() { close(resume); workers.Wait() }()
-	for _, method := range []string{http.MethodPost, http.MethodPost, http.MethodPut, http.MethodPut} {
+	for _, request := range []struct {
+		method string
+		lease  Lease
+	}{
+		{http.MethodPost, l},
+		{http.MethodPost, l},
+		{http.MethodPut, l},
+		{http.MethodPut, other},
+	} {
 		started := make(chan struct{})
-		req := testRequest(t, method, "site")
+		req := testRequest(t, request.method, "site")
 		req.Body = &gatedBody{ReadCloser: req.Body, started: started, resume: resume}
 		workers.Add(1)
-		go func() { defer workers.Done(); c.Handle(httptest.NewRecorder(), req, l.ID, c.Generation(l.ID)) }()
+		go func() {
+			defer workers.Done()
+			c.Handle(httptest.NewRecorder(), req, request.lease.ID, c.Generation(request.lease.ID))
+		}()
 		select {
 		case <-started:
 		case <-time.After(5 * time.Second):
-			t.Fatalf("internal %s capacity was not available", method)
+			t.Fatalf("internal %s capacity was not available", request.method)
 		}
 	}
 	for _, method := range []string{http.MethodPost, http.MethodPut} {
@@ -506,12 +521,12 @@ func TestDetachOwnerRejectsInFlightCacheRequests(t *testing.T) {
 			}()
 			<-started
 			c.DetachOwner(lease.Owner)
-			// After access is restored, a fresh request can republish on the
-			// retained lease. The older request must not replace or retire it.
-			fresh := httptest.NewRecorder()
-			c.Handle(fresh, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
 			close(resume)
 			code := <-codes
+			// The old upload must release its per-owner slot before the
+			// retained lease can publish a fresh generation.
+			fresh := httptest.NewRecorder()
+			c.Handle(fresh, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
 			if code != http.StatusForbidden || fresh.Code != http.StatusOK {
 				t.Fatalf("old request = %d, fresh upload = %d", code, fresh.Code)
 			}
