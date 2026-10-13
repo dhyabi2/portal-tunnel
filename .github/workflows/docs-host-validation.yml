@@ -1,0 +1,71 @@
+name: Documentation Host Validation
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs-host-validation.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs-host-validation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        working-directory: docs
+      - run: bun run build
+        working-directory: docs
+      - name: Check dev and preview Host validation
+        working-directory: docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in dev preview; do
+            if [[ "$mode" == dev ]]; then
+              port=5173
+            else
+              port=4173
+            fi
+            bun run "$mode" --host 127.0.0.1 --port "$port" --strictPort > "/tmp/vite-$mode.log" 2>&1 &
+            pid=$!
+            trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+            for attempt in {1..60}; do
+              allowed_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 3 \
+                --header "Host: localhost:$port" "http://127.0.0.1:$port/" || true)"
+              if [[ "$allowed_status" == 200 ]]; then
+                break
+              fi
+              if ! kill -0 "$pid" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+
+            if [[ "$allowed_status" != 200 ]]; then
+              cat "/tmp/vite-$mode.log"
+              echo "::error::Vite $mode did not serve approved localhost Host (HTTP $allowed_status)"
+              exit 1
+            fi
+
+            rejected_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 3 \
+              --header "Host: rebinding.attacker.example:$port" "http://127.0.0.1:$port/")"
+            if [[ "$rejected_status" != 403 ]]; then
+              echo "::error::Vite $mode accepted unapproved Host (HTTP $rejected_status)"
+              exit 1
+            fi
+
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" || true
+            trap - EXIT
+          done
