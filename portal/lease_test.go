@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gosuda/portal-tunnel/v2/portal/identity"
+	"github.com/gosuda/portal-tunnel/v2/portal/transport"
 	"github.com/gosuda/portal-tunnel/v2/types"
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
@@ -691,5 +693,194 @@ func TestLeaseRegistrationFailureReleasesPorts(t *testing.T) {
 	_, actual, _ := net.SplitHostPort(response.TCPAddr)
 	if actual != fmt.Sprint(port) {
 		t.Fatalf("registration leaked its reserved TCP port: got %s, want %d", actual, port)
+	}
+}
+
+func TestRequestedLeaseTTLBounds(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		seconds int
+		want    time.Duration
+		invalid bool
+	}{
+		{name: "default", seconds: 0, want: defaultLeaseTTL},
+		{name: "negative keeps default", seconds: -1, want: defaultLeaseTTL},
+		{name: "maximum", seconds: int(maxLeaseTTL / time.Second), want: maxLeaseTTL},
+		{name: "above maximum", seconds: int(maxLeaseTTL/time.Second) + 1, invalid: true},
+		{name: "overflow size", seconds: math.MaxInt, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := requestedLeaseTTL(tc.seconds)
+			if tc.invalid {
+				if !errors.Is(err, errLeaseTTLExceeded) {
+					t.Fatalf("requestedLeaseTTL(%d) error = %v, want maximum TTL rejection", tc.seconds, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("requestedLeaseTTL(%d) = %s, %v, want %s", tc.seconds, got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLeaseTTLValidationBeforeAllocationOrRenewal(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	request := types.RegisterChallengeRequest{Identity: newTestLeaseIdentity(t, "ttl-limit")}
+	source := netip.MustParseAddr("203.0.113.40")
+	for _, invalidTTL := range []int{int(maxLeaseTTL/time.Second) + 1, math.MaxInt} {
+		request.TTL = invalidTTL
+		if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, source); !errors.Is(err, errLeaseTTLExceeded) {
+			t.Fatalf("issueRegisterChallenge(TTL=%d) error = %v", invalidTTL, err)
+		}
+		if _, _, err := registry.Register(request, source, "", types.RelayDescriptor{}, nil); !errors.Is(err, errLeaseTTLExceeded) {
+			t.Fatalf("Register(TTL=%d) error = %v", invalidTTL, err)
+		}
+		if len(registry.records) != 0 {
+			t.Fatal("rejected TTL allocated a registry record")
+		}
+	}
+
+	request.TTL = int(maxLeaseTTL / time.Second)
+	record, response, err := registry.Register(request, source, "", types.RelayDescriptor{}, nil)
+	if err != nil {
+		t.Fatalf("Register(maximum TTL) error = %v", err)
+	}
+	if remaining := time.Until(response.ExpiresAt); remaining <= maxLeaseTTL-time.Minute || remaining > maxLeaseTTL {
+		t.Fatalf("registered TTL = %s, want at most %s", remaining, maxLeaseTTL)
+	}
+	originalExpiry := record.ExpiresAt
+	for _, invalidTTL := range []int{int(maxLeaseTTL/time.Second) + 1, math.MaxInt} {
+		if _, _, err := registry.Renew(types.RenewRequest{AccessToken: response.AccessToken, TTL: invalidTTL}, source); !errors.Is(err, errLeaseTTLExceeded) {
+			t.Fatalf("Renew(TTL=%d) error = %v", invalidTTL, err)
+		}
+		if !record.ExpiresAt.Equal(originalExpiry) {
+			t.Fatal("rejected renewal extended the existing lease")
+		}
+	}
+	if _, err := registry.admitLeaseByToken(response.AccessToken, false); err != nil {
+		t.Fatalf("original token invalid after rejected renewal: %v", err)
+	}
+	renewed, _, err := registry.Renew(types.RenewRequest{AccessToken: response.AccessToken, TTL: int(maxLeaseTTL / time.Second)}, source)
+	if err != nil {
+		t.Fatalf("Renew(maximum TTL) error = %v", err)
+	}
+	if remaining := time.Until(renewed.ExpiresAt); remaining <= maxLeaseTTL-time.Minute || remaining > maxLeaseTTL {
+		t.Fatalf("renewed TTL = %s, want at most %s", remaining, maxLeaseTTL)
+	}
+}
+
+func TestLeaseRegistryLiveCapacity(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	identity := newTestLeaseIdentity(t, "quota-client")
+	until := time.Now().Add(time.Hour)
+	for i := range maxLiveLeases {
+		registry.records = append(registry.records, &leaseRecord{
+			Identity:   types.Identity{Name: fmt.Sprintf("existing-%d", i), Address: identity.Address},
+			ExpiresAt:  until,
+			sourceAddr: netip.MustParseAddr("203.0.113.1"),
+			reverse:    transport.NewReversePool(defaultIdleKeepalive, defaultReadyQueueLimit),
+		})
+	}
+	_, _, err := registry.Register(types.RegisterChallengeRequest{Identity: identity}, netip.MustParseAddr("203.0.113.2"), "", types.RelayDescriptor{}, nil)
+	if !errors.Is(err, errLeaseCapacityExceeded) || len(registry.records) != maxLiveLeases {
+		t.Fatalf("Register() at total capacity: records=%d error=%v", len(registry.records), err)
+	}
+
+	// Eviction makes a slot available without waiting for the expiry janitor.
+	removed := registry.EvictLease(registry.records[0].ServiceKey())
+	if removed == nil || len(registry.records) != maxLiveLeases-1 {
+		t.Fatal("EvictLease() failed to reclaim a quota slot")
+	}
+	if _, _, err := registry.Register(types.RegisterChallengeRequest{Identity: identity}, netip.MustParseAddr("203.0.113.2"), "", types.RelayDescriptor{}, nil); err != nil {
+		t.Fatalf("Register() after eviction error = %v", err)
+	}
+}
+
+func TestLeaseRegistryPerSourceCapacityAndImmediateRawEviction(t *testing.T) {
+	registry := newTestRegistry(t, true, true)
+	identity := newTestLeaseIdentity(t, "quota-raw")
+	source := netip.MustParseAddr("203.0.113.40")
+	for i := range maxLiveLeasesPerSource {
+		registry.records = append(registry.records, &leaseRecord{
+			Identity:   types.Identity{Name: fmt.Sprintf("from-source-%d", i), Address: identity.Address},
+			ExpiresAt:  time.Now().Add(time.Hour),
+			sourceAddr: source,
+			reverse:    transport.NewReversePool(defaultIdleKeepalive, defaultReadyQueueLimit),
+		})
+	}
+	request := types.RegisterChallengeRequest{Identity: identity, UDPEnabled: true, TCPEnabled: true}
+	if _, _, err := registry.Register(request, source, "", types.RelayDescriptor{}, nil); !errors.Is(err, errLeaseCapacityExceeded) {
+		t.Fatalf("Register() at source capacity error = %v", err)
+	}
+	if len(registry.udpPorts.inUse) != 0 || len(registry.tcpPorts.inUse) != 0 || len(registry.udpPorts.reserved) != 0 || len(registry.tcpPorts.reserved) != 0 {
+		t.Fatal("capacity denial allocated raw transport ports")
+	}
+
+	otherSource := netip.MustParseAddr("203.0.113.41")
+	record, response, err := registry.Register(request, otherSource, "", types.RelayDescriptor{}, nil)
+	if err != nil {
+		t.Fatalf("Register() from different source error = %v", err)
+	}
+	udpPort, tcpPort := record.datagram.UDPPort(), record.tcpPort
+	if got := registry.EvictLease(identity.ServiceKey()); got != record {
+		t.Fatal("EvictLease() returned a different lease")
+	}
+	if _, ok := registry.Lookup(response.CanonicalHostname); ok {
+		t.Fatal("evicted lease is still routable")
+	}
+	if _, err := registry.admitLeaseByToken(response.AccessToken, false); !errors.Is(err, errLeaseNotFound) {
+		t.Fatalf("evicted lease token admitted: %v", err)
+	}
+	if len(registry.udpPorts.inUse) != 0 || len(registry.tcpPorts.inUse) != 0 || len(registry.udpPorts.reserved) != 0 || len(registry.tcpPorts.reserved) != 0 {
+		t.Fatal("eviction retained raw port ownership or grace reservations")
+	}
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{Port: tcpPort})
+	if err != nil {
+		t.Fatalf("eviction did not close TCP listener: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request.Identity = newTestLeaseIdentity(t, "replacement-raw")
+	newRecord, _, err := registry.Register(request, otherSource, "", types.RelayDescriptor{}, nil)
+	if err != nil {
+		t.Fatalf("Register() after eviction error = %v", err)
+	}
+	if newRecord.datagram.UDPPort() != udpPort || newRecord.tcpPort != tcpPort {
+		t.Fatalf("evicted ports not immediately reusable: UDP %d/%d, TCP %d/%d", newRecord.datagram.UDPPort(), udpPort, newRecord.tcpPort, tcpPort)
+	}
+}
+
+func TestRegisterChallengeTotalCapacity(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	expiresAt := time.Now().Add(time.Minute)
+	for range maxPendingRegisterChallenges {
+		registry.records = append(registry.records, &leaseRecord{
+			ExpiresAt:         expiresAt,
+			sourceAddr:        netip.MustParseAddr("203.0.113.1"),
+			registerChallenge: &identity.RegisterChallenge{ExpiresAt: expiresAt},
+		})
+	}
+	request := types.RegisterChallengeRequest{Identity: newTestLeaseIdentity(t, "challenge-limit")}
+	source := netip.MustParseAddr("203.0.113.2")
+	if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, source); !errors.Is(err, errRegisterChallengeCapacity) {
+		t.Fatalf("issueRegisterChallenge() at total capacity error = %v", err)
+	}
+	registry.mu.Lock()
+	for _, record := range registry.records {
+		record.ExpiresAt = time.Now().Add(-time.Second)
+	}
+	registry.mu.Unlock()
+	if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, source); err != nil {
+		t.Fatalf("issueRegisterChallenge() after expiry error = %v", err)
 	}
 }
