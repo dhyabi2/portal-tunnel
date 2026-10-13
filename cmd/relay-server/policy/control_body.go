@@ -61,7 +61,7 @@ func isControlBodyRequest(r *http.Request) bool {
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	switch path {
 	case types.PathSDKCache, types.PathSDKConnect,
-		case types.PathSDKRegisterChallenge, types.PathSDKRegister,
+		types.PathSDKRegisterChallenge, types.PathSDKRegister,
 		types.PathSDKRenew, types.PathSDKReverse, types.PathSDKUnregister,
 		types.PathDiscoveryAnnounce, types.PathV1Sign,
 		types.PathAdminAuthLogin, types.PathPolicy, types.PathPolicyLeases:
