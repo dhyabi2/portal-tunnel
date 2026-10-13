@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/installer"
 	"github.com/gosuda/portal-tunnel/v2/cmd/relay-server/policy"
 	"github.com/gosuda/portal-tunnel/v2/portal"
 	"github.com/gosuda/portal-tunnel/v2/types"
@@ -49,6 +50,34 @@ func TestRelayLLMsNeverRecommendsRelayHostedInstallers(t *testing.T) {
 	}
 	if !strings.Contains(body, "portal expose 3000 --relays https://untrusted-relay.example.com --discovery=false") {
 		t.Fatal("relay selection was lost from the expose command")
+	}
+}
+
+func TestRelayNativeBinariesRedirectToOfficialPublisher(t *testing.T) {
+	for _, suffix := range []string{"linux-amd64", "darwin-arm64", "windows-amd64", "linux-amd64.sha256"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			t.Run(method+"/"+suffix, func(t *testing.T) {
+				response := httptest.NewRecorder()
+				serveInstallBinary(response, httptest.NewRequest(method, types.PathInstallBinPrefix+suffix, nil))
+				if response.Code != http.StatusTemporaryRedirect {
+					t.Fatalf("status = %d, want 307", response.Code)
+				}
+				location := response.Header().Get("Location")
+				if !strings.HasPrefix(location, "https://github.com/gosuda/portal-tunnel/releases/latest/download/") {
+					t.Fatalf("untrusted native artifact publisher: %s", location)
+				}
+				filename, ok := installer.AssetFilename(strings.TrimSuffix(suffix, ".sha256"))
+				if !ok {
+					t.Fatal("unexpected test artifact")
+				}
+				if strings.HasSuffix(suffix, ".sha256") {
+					filename += ".sha256"
+				}
+				if !strings.HasSuffix(location, "/"+filename) {
+					t.Fatalf("unexpected publisher artifact: %s", location)
+				}
+			})
+		}
 	}
 }
 
