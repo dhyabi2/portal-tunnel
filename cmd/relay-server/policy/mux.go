@@ -139,12 +139,12 @@ func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *S
 	}))
 	mux.Handle("/", fallback)
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return newControlBodyGate().wrap(ingress, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if utils.HandleAPICORS(w, r) {
 			return
 		}
 		mux.ServeHTTP(w, r)
-	})
+	}))
 }
 
 // WriteRetryAfter answers a rejected admission with the limiter's retry
