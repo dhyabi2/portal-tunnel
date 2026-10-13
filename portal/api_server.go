@@ -76,7 +76,7 @@ var (
 	errTCPPortCapacityExceeded   = &apiError{types.APIErrorCodeTCPPortCapacityExceeded, "tcp port capacity exceeded", http.StatusServiceUnavailable}
 	errTCPPortExhausted          = &apiError{types.APIErrorCodeTCPPortExhausted, "no tcp ports available", http.StatusServiceUnavailable}
 	errRegisterChallengePending  = &apiError{types.APIErrorCodeRateLimited, "too many pending register challenges", http.StatusTooManyRequests}
-	errRegisterChallengeCapacity = &apiError{types.APIErrorCodeRateLimited, "relay pending register challenge capacity exceeded", http.StatusTooManyRequests}
+	errRegisterChallengeFull = &apiError{types.APIErrorCodeRateLimited, "relay pending register challenge capacity exceeded", http.StatusTooManyRequests}
 )
 
 func writeAPIErrorResponse(w http.ResponseWriter, err error) {
