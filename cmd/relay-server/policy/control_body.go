@@ -3,6 +3,7 @@ package policy
 import (
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,14 +51,23 @@ func (g *controlBodyGate) release(source netip.Addr) {
 	}
 }
 
-// Only authenticated cache uploads have a separate streaming body deadline.
-// Normal reverse connections carry no HTTP request body.
+// Bound short-lived JSON control routes without affecting reverse upgrades,
+// cache uploads (which have their own timeouts), or application-owned streams.
 func isControlBodyRequest(r *http.Request) bool {
 	if r.Body == nil || r.Body == http.NoBody {
 		return false
 	}
-	return r.URL.Path != types.PathSDKCache ||
-		(r.Method != http.MethodPost && r.Method != http.MethodPut)
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	switch path {
+	case types.PathSDKRegisterChallenge, types.PathSDKRegister,
+		types.PathSDKRenew, types.PathSDKReverse, types.PathSDKUnregister,
+		types.PathDiscoveryAnnounce, types.PathV1Sign,
+		types.PathAdminAuthLogin, types.PathPolicy, types.PathPolicyLeases:
+		return true
+	}
+	return path == types.PathAPIPrefix+"/reputation/vote" ||
+		path == types.PathAPIPrefix+"/x402" ||
+		strings.HasPrefix(path, types.PathAPIPrefix+"/x402/")
 }
 
 func (g *controlBodyGate) wrap(ingress *Ingress, next http.Handler) http.Handler {
