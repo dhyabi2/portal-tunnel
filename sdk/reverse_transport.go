@@ -57,8 +57,12 @@ func (t *leaseReverseTransport) openRaw(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	netDialer := &net.Dialer{Timeout: defaultDialTimeout}
+	if t.listener.isAlternateReverseEndpoint(reverseURL.String()) {
+		netDialer.ControlContext = publicGatewayDialControl
+	}
 	dialer := &tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: defaultDialTimeout},
+		NetDialer: netDialer,
 		Config:    reverseTLS,
 	}
 	conn, err := dialer.DialContext(ctx, "tcp", utils.EnsurePort(reverseURL.Host))

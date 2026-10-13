@@ -717,23 +717,31 @@ func (l *listener) isAlternateReverseEndpoint(rawURL string) bool {
 }
 
 func (l *listener) validateReverseEndpointTransport(endpoint types.ReverseEndpoint) error {
+	alternate := l.isAlternateReverseEndpoint(endpoint.URL)
 	if !l.overlay {
-		if endpoint.Overlay {
+		if endpoint.Overlay || endpoint.Gateway != nil {
 			return errors.New("relay returned an overlay reverse endpoint but overlay is disabled")
 		}
-		if l.isAlternateReverseEndpoint(endpoint.URL) {
+		if alternate {
 			return fmt.Errorf("relay reverse endpoint %s does not match the relay URL; align the relay's PORTAL_URL with the address clients dial", endpoint.URL)
 		}
 		return nil
 	}
-	if !endpoint.Overlay && !l.isAlternateReverseEndpoint(endpoint.URL) {
+	if !alternate {
+		if endpoint.Overlay || endpoint.Gateway != nil {
+			return errors.New("relay returned overlay authorization for a direct reverse endpoint")
+		}
 		l.warnOverlayDirect.Do(func() {
 			log.Warn().
 				Str("relay_url", l.api.relayURL.String()).
 				Msg("overlay requested but the relay serves a direct reverse endpoint; continuing without overlay forwarding")
 		})
+		return nil
 	}
-	return nil
+	if !endpoint.Overlay {
+		return errors.New("relay returned an alternate reverse endpoint without overlay authorization")
+	}
+	return validateOverlayGateway(endpoint)
 }
 
 func (l *listener) runDatagramLoop(ctx context.Context) error {
@@ -819,6 +827,9 @@ func (l *listener) reverseTarget() (*url.URL, string, error) {
 	}
 	if !lease.reverse.ExpiresAt.After(time.Now().UTC()) {
 		return nil, "", errLeaseRefreshRequired
+	}
+	if err := l.validateReverseEndpointTransport(lease.reverse); err != nil {
+		return nil, "", fmt.Errorf("validate reverse endpoint: %w", err)
 	}
 	if l.api.tlsConfigClone() == nil {
 		return nil, "", errors.New("relay tls config is unavailable")

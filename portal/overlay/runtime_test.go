@@ -137,12 +137,12 @@ func TestIssueEndpointRotatesGatewayWithoutChangingLease(t *testing.T) {
 		Descriptors:   relays.Descriptors(types.RelayDescriptor{}),
 	}
 	initial, ok, err := runtime.IssueEndpoint(input)
-	if err != nil || !ok || initial.URL != "https://first.example/sdk/connect" {
+	if err != nil || !ok || initial.URL != "https://first.example/sdk/connect" || initial.Gateway == nil || initial.Gateway.Signature != first.Signature {
 		t.Fatalf("initial endpoint = %#v, %v, %v", initial, ok, err)
 	}
 	input.FailedURL = initial.URL
 	replacement, ok, err := runtime.IssueEndpoint(input)
-	if err != nil || !ok || replacement.URL != "https://second.example/sdk/connect" {
+	if err != nil || !ok || replacement.URL != "https://second.example/sdk/connect" || replacement.Gateway == nil || replacement.Gateway.Signature != second.Signature {
 		t.Fatalf("replacement endpoint = %#v, %v, %v", replacement, ok, err)
 	}
 	input.FailedURL = replacement.URL
