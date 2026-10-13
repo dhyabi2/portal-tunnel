@@ -51,15 +51,17 @@ func (g *controlBodyGate) release(source netip.Addr) {
 	}
 }
 
-// Bound short-lived JSON control routes without affecting reverse upgrades,
-// cache uploads (which have their own timeouts), or application-owned streams.
+// Bound control-plane bodies, including unauthenticated cache requests.
+// Cache uploads extend this deadline after authorization. Application-owned
+// streaming routes and valid bodyless reverse upgrades are unaffected.
 func isControlBodyRequest(r *http.Request) bool {
 	if r.Body == nil || r.Body == http.NoBody {
 		return false
 	}
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	switch path {
-	case types.PathSDKRegisterChallenge, types.PathSDKRegister,
+	case types.PathSDKCache, types.PathSDKConnect,
+		case types.PathSDKRegisterChallenge, types.PathSDKRegister,
 		types.PathSDKRenew, types.PathSDKReverse, types.PathSDKUnregister,
 		types.PathDiscoveryAnnounce, types.PathV1Sign,
 		types.PathAdminAuthLogin, types.PathPolicy, types.PathPolicyLeases:
@@ -72,13 +74,6 @@ func isControlBodyRequest(r *http.Request) bool {
 
 func (g *controlBodyGate) wrap(ingress *Ingress, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == types.PathSDKConnect && r.Method == http.MethodGet && r.Body != nil && r.Body != http.NoBody {
-			if r.ProtoMajor == 1 {
-				w.Header().Set("Connection", "close")
-			}
-			utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest, "reverse connect requests must not contain a body")
-			return
-		}
 		if !isControlBodyRequest(r) {
 			next.ServeHTTP(w, r)
 			return
@@ -94,16 +89,22 @@ func (g *controlBodyGate) wrap(ingress *Ingress, next http.Handler) http.Handler
 			WriteRetryAfter(w, time.Second, "too many active control requests")
 			return
 		}
-		defer g.release(source)
-
 		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(controlBodyReadTimeout)); err != nil {
 			utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeInternal, "control request body deadline unavailable")
+			g.release(source)
 			return
 		}
+		defer func() {
+			// Preserve the in-flight permit while closing any unread body.
+			// net/http also closes the body after the handler returns.
+			_ = r.Body.Close()
+			g.release(source)
+		}()
 
-		// Keep this deadline through net/http's post-handler body cleanup.
-		// The server resets it on the next HTTP/1 request; upgrade routes
-		// never enter this guard.
+		if r.URL.Path == types.PathSDKConnect && r.Method == http.MethodGet {
+			utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest, "reverse connect requests must not contain a body")
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
