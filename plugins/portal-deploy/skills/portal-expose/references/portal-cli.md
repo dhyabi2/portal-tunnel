@@ -24,7 +24,7 @@ $ProgressPreference = 'SilentlyContinue'
 irm https://github.com/gosuda/portal-tunnel/releases/latest/download/install.ps1 | iex
 ```
 
-Installation changes user or system paths. Obtain approval before running it. A relay also serves an installer at `<relay>/api/install.sh` and `<relay>/api/install.ps1`, which is what its website's quick start shows. Prefer the official GitHub installer. If the user insists on the relay-hosted one, verify the installed binary against the `checksums.txt` or `.sha256` asset of the matching GitHub release, fetched from github.com, because the relay serves the script, the binary, and the checksum together and a relay-provided checksum authenticates nothing on its own.
+Installation changes user or system paths. Obtain approval before running it. Download installers from official GitHub releases only. Relay-hosted installers are retired (HTTP 410); relay-supplied checksums cannot authenticate relay-supplied executables. The relay selection belongs in `--relays`.
 
 ## Temporary exposure
 
