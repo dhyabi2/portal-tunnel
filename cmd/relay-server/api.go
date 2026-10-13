@@ -314,6 +314,23 @@ func (api *RelayAPI) servePolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		api.commitAccess(proposedAccess)
 		utils.WriteAPIData(w, http.StatusOK, map[string]any{})
+	case types.PathPolicyLeaseEvict:
+		if !utils.RequireMethod(w, r, http.MethodPost) {
+			return
+		}
+		req, ok := utils.DecodeJSONRequestAs[types.LeaseEvictRequest](w, r, controlBodyLimit, invalidRequestBody)
+		if !ok {
+			return
+		}
+		key, ok := normalizePolicyIdentityKey(w, req.IdentityKey)
+		if !ok {
+			return
+		}
+		if !api.server.EvictLease(key) {
+			utils.WriteAPIError(w, http.StatusNotFound, types.APIErrorCodeLeaseNotFound, "lease not found")
+			return
+		}
+		utils.WriteAPIData(w, http.StatusOK, map[string]any{})
 	default:
 		http.NotFound(w, r)
 	}
