@@ -24,9 +24,11 @@ type Manager struct {
 	retired    []*cachedSite
 	used       int64
 	snapshots  int
-	population chan struct{}
-	checks     chan struct{}
-	generation uint64
+	uploadActive      map[types.ServiceIdentityKey]struct{}
+	uploadQueue       []*uploadWaiter
+	uploadIdleTimeout time.Duration
+	checks            chan struct{}
+	generation        uint64
 }
 
 type cachedSite struct {
@@ -79,8 +81,9 @@ func New(cfg Config, dir string) (*Manager, error) {
 		cfg: cfg, dir: dir,
 		limits: types.StaticCacheLimits{MaxExposureBytes: int64(exposureBytes), MaxObjectSize: int64(min(10<<20, exposureBytes))},
 		leases: make(map[string]leaseState), entries: make(map[string]*cachedSite),
-		population: make(chan struct{}, 2),
-		checks:     make(chan struct{}, 2),
+		uploadActive:      make(map[types.ServiceIdentityKey]struct{}),
+		uploadIdleTimeout: 10 * time.Second,
+		checks:            make(chan struct{}, 2),
 	}, nil
 }
 
