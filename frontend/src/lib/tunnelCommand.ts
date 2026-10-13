@@ -1,6 +1,8 @@
-import { RELAY_API_PATHS } from "@/lib/apiPaths";
 import { normalizeExposeName } from "@/lib/exposeName";
 import type { ShareKind } from "@/lib/shareLink";
+
+const OFFICIAL_INSTALLER_BASE_URL =
+  "https://github.com/gosuda/portal-tunnel/releases/latest/download";
 
 export type TunnelCommandOS = "unix" | "windows";
 
@@ -53,14 +55,8 @@ function buildTunnelCommandParts({
   const leadingArgs = isFile
     ? ["--serve", formatToken(servePath, os)]
     : [formatToken(targetValue, os)];
-  const installScriptURL = new URL(
-    RELAY_API_PATHS.install.shell,
-    currentOrigin
-  ).toString();
-  const installPowerShellURL = new URL(
-    RELAY_API_PATHS.install.powershell,
-    currentOrigin
-  ).toString();
+  const installScriptURL = `${OFFICIAL_INSTALLER_BASE_URL}/install.sh`;
+  const installPowerShellURL = `${OFFICIAL_INSTALLER_BASE_URL}/install.ps1`;
 
   const exposeArgs: string[] = [];
 
@@ -97,10 +93,9 @@ function buildTunnelCommandParts({
     };
   }
 
-  const curlFlags = isLocalRelayOrigin(currentOrigin) ? "-ksSL" : "-sSL";
   return {
     // bash runs the installer in a subshell, so add its install dirs to this shell's PATH.
-    installLine: `curl ${curlFlags} ${formatToken(installScriptURL, os)} | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
+    installLine: `curl -fsSL ${formatToken(installScriptURL, os)} | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
     exposeHead: "portal expose",
     exposeOptions: [...leadingArgs, ...exposeArgs],
   };
@@ -160,24 +155,6 @@ function getRelayOriginHost(origin: string): string {
   } catch {
     return "";
   }
-}
-
-function isLocalRelayOrigin(origin: string): boolean {
-  try {
-    const parsed = new URL(origin);
-    return isLocalRelayHostname(parsed.hostname.trim().toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
-function isLocalRelayHostname(hostname: string): boolean {
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    hostname.endsWith(".localhost")
-  );
 }
 
 function quoteShellValue(value: string): string {
