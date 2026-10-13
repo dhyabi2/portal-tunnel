@@ -872,7 +872,7 @@ func TestRegisterChallengeTotalCapacity(t *testing.T) {
 	}
 	request := types.RegisterChallengeRequest{Identity: newTestLeaseIdentity(t, "challenge-limit")}
 	source := netip.MustParseAddr("203.0.113.2")
-	if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, source); !errors.Is(err, errRegisterChallengeCapacity) {
+	if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, source); !errors.Is(err, errRegisterChallengeFull) {
 		t.Fatalf("issueRegisterChallenge() at total capacity error = %v", err)
 	}
 	registry.mu.Lock()
