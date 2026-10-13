@@ -150,7 +150,7 @@ func (api *RelayAPI) servePublicState(w http.ResponseWriter, r *http.Request) {
 	}
 	utils.WriteAPIData(w, http.StatusOK, publicStateResponse{
 		PublicStateResponse: types.PublicStateResponse{Leases: leases, LandingPageEnabled: landingPageEnabled},
-		Reputation:          api.reputation.Summaries(api.reputation.ViewerHashFor(voterCookieID), publicIdentityLeases(leases, api.server)),
+		Reputation:          api.reputation.Summaries(api.reputation.ViewerHashFor(voterCookieID), publicIdentityLeases(leases, api.server.PolicyLeases())),
 	})
 }
 
@@ -778,7 +778,8 @@ func (api *RelayAPI) serveReputationVote(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	identity := ""
-	for _, lease := range publicIdentityLeases(api.server.PublicLeases(), api.server) {
+	live := api.server.PolicyLeases()
+	for _, lease := range publicIdentityLeases(api.server.PublicLeases(), live) {
 		if utils.NormalizeHostname(lease.Hostname) == hostname || utils.NormalizeHostname(lease.CanonicalHostname) == hostname {
 			identity = lease.IdentityKey
 			break
@@ -788,7 +789,7 @@ func (api *RelayAPI) serveReputationVote(w http.ResponseWriter, r *http.Request)
 	if cookie, err := r.Cookie(reputationVoterCookie); err == nil {
 		voterCookieID = cookie.Value
 	}
-	summary, minted, err := api.reputation.CastVote(hostname, identity, vote, voterCookieID, sourceAddr)
+	summary, minted, err := api.reputation.CastVote(hostname, identity, vote, voterCookieID, sourceAddr, live)
 	if err != nil {
 		switch {
 		case errors.Is(err, policy.ErrReputationCapacity):
@@ -815,13 +816,13 @@ func (api *RelayAPI) serveReputationVote(w http.ResponseWriter, r *http.Request)
 	utils.WriteAPIData(w, http.StatusOK, summary)
 }
 
-func publicIdentityLeases(public []types.Lease, server *portal.Server) []types.PolicyLease {
+func publicIdentityLeases(public []types.Lease, live []types.PolicyLease) []types.PolicyLease {
 	known := make(map[string]bool)
 	for _, lease := range public {
 		known[utils.NormalizeHostname(lease.CanonicalHostname)] = true
 	}
 	leases := make([]types.PolicyLease, 0)
-	for _, lease := range server.PolicyLeases() {
+	for _, lease := range live {
 		if known[utils.NormalizeHostname(lease.CanonicalHostname)] && lease.IdentityKey != "" {
 			leases = append(leases, lease)
 		}

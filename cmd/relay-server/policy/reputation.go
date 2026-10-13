@@ -35,9 +35,8 @@ const (
 const (
 	reputationVoterIDBytes = 32
 
-	// Whole-file JSON is rewritten on each changed vote so these caps keep
-	// the work per public POST small; identities persist for the life of
-	// the state file, so past the identity cap new identities are rejected.
+	// Whole-file JSON is rewritten on each changed vote, so these caps keep
+	// the work per public POST bounded even as inactive records are recycled.
 	reputationMaxVoters     = 1024
 	reputationMaxIdentities = 4096
 )
@@ -47,6 +46,7 @@ const (
 type persistedReputation struct {
 	VoterSecret []byte                       `json:"voter_secret"`
 	Identities  map[string]map[string]string `json:"identities,omitempty"`
+	LastVoteAt  map[string]int64             `json:"last_vote_at,omitempty"`
 }
 
 // ReputationSummary is one directory row for a live hostname.
@@ -111,8 +111,9 @@ func (s *ReputationStore) AllowVote(source netip.Addr) time.Duration {
 // CastVote resolves the voter (minting a cookieless identity when needed),
 // applies the vote, and persists atomically under one lock. The returned
 // mint value is a fresh cookie value, set only when a new voter was minted.
-// The identity comes from the relay's current public leases.
-func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, source netip.Addr) (ReputationSummary, string, error) {
+// The identity comes from the relay's current public leases. The live lease
+// snapshot must include all active identities, including the vote target.
+func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, source netip.Addr, live []types.PolicyLease) (ReputationSummary, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if identity == "" {
@@ -127,10 +128,33 @@ func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, so
 	if previous != nil && previous[hash] == vote {
 		return s.summarize(hostname, previous, hash), minted, nil
 	}
-	if previous == nil && len(s.state.Identities) >= reputationMaxIdentities {
-		return ReputationSummary{}, "", ErrReputationCapacity
-	}
 	nextIdentities := maps.Clone(s.state.Identities)
+	nextLastVoteAt := maps.Clone(s.state.LastVoteAt)
+	if previous == nil && len(nextIdentities) >= reputationMaxIdentities {
+		active := make(map[string]struct{}, len(live))
+		for _, lease := range live {
+			active[lease.IdentityKey] = struct{}{}
+		}
+		// Only reclaim an identity absent from the current lease registry.
+		// Missing timestamps from older state files sort before new votes.
+		var oldest string
+		var oldestAt int64
+		found := false
+		for candidate := range nextIdentities {
+			if _, ok := active[candidate]; ok {
+				continue
+			}
+			votedAt := nextLastVoteAt[candidate]
+			if !found || votedAt < oldestAt || (votedAt == oldestAt && candidate < oldest) {
+				oldest, oldestAt, found = candidate, votedAt, true
+			}
+		}
+		if !found {
+			return ReputationSummary{}, "", ErrReputationCapacity
+		}
+		delete(nextIdentities, oldest)
+		delete(nextLastVoteAt, oldest)
+	}
 	votes := maps.Clone(previous)
 	if votes == nil {
 		votes = make(map[string]string)
@@ -140,8 +164,13 @@ func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, so
 	}
 	votes[hash] = vote
 	nextIdentities[identity] = votes
+	if nextLastVoteAt == nil {
+		nextLastVoteAt = make(map[string]int64)
+	}
+	nextLastVoteAt[identity] = time.Now().UnixNano()
 	nextState := s.state
 	nextState.Identities = nextIdentities
+	nextState.LastVoteAt = nextLastVoteAt
 
 	if err := utils.WriteJSONFile(s.path, nextState, 0o600); err != nil {
 		return ReputationSummary{}, "", fmt.Errorf("persist reputation: %w", err)

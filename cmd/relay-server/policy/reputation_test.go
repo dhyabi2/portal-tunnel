@@ -1,7 +1,12 @@
 package policy
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -27,15 +32,15 @@ func testLeases(names ...string) []types.PolicyLease {
 
 func TestReputationVoteSwitchAndRestart(t *testing.T) {
 	store := newTestReputationStore(t)
-	first, cookie, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteUp, "", netip.MustParseAddr("203.0.113.10"))
+	first, cookie, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteUp, "", netip.MustParseAddr("203.0.113.10"), testLeases("demo.example.com"))
 	if err != nil || first.Up != 1 || cookie == "" {
 		t.Fatalf("first vote = %+v, cookie=%q, err=%v", first, cookie, err)
 	}
-	same, _, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteUp, cookie, netip.MustParseAddr("203.0.113.10"))
+	same, _, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteUp, cookie, netip.MustParseAddr("203.0.113.10"), testLeases("demo.example.com"))
 	if err != nil || same.Up != 1 {
 		t.Fatalf("same vote changed state: %+v, err=%v", same, err)
 	}
-	switched, _, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteDown, cookie, netip.MustParseAddr("203.0.113.10"))
+	switched, _, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteDown, cookie, netip.MustParseAddr("203.0.113.10"), testLeases("demo.example.com"))
 	if err != nil || switched.Up != 0 || switched.Down != 1 || switched.ViewerVote != VoteDown {
 		t.Fatalf("switched vote = %+v, err=%v", switched, err)
 	}
@@ -50,11 +55,11 @@ func TestReputationVoteSwitchAndRestart(t *testing.T) {
 
 func TestReputationDirectoryProjectsLiveHostsAndViewerVote(t *testing.T) {
 	store := newTestReputationStore(t)
-	_, cookie, err := store.CastVote("voted.example.com", "id:voted.example.com", VoteUp, "", netip.MustParseAddr("203.0.113.10"))
+	_, cookie, err := store.CastVote("voted.example.com", "id:voted.example.com", VoteUp, "", netip.MustParseAddr("203.0.113.10"), testLeases("voted.example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.CastVote("old.example.com", "id:old.example.com", VoteUp, cookie, netip.MustParseAddr("203.0.113.10")); err != nil {
+	if _, _, err := store.CastVote("old.example.com", "id:old.example.com", VoteUp, cookie, netip.MustParseAddr("203.0.113.10"), testLeases("voted.example.com", "old.example.com")); err != nil {
 		t.Fatal(err)
 	}
 	summaries := store.Summaries(store.ViewerHashFor(cookie), testLeases("voted.example.com", "old.example.com", "fresh.example.com"))
@@ -91,5 +96,143 @@ func TestReputationDirectoryPrefersCanonicalHostname(t *testing.T) {
 	got := store.Summaries("", []types.PolicyLease{lease})
 	if len(got) != 1 || got[0].Hostname != lease.CanonicalHostname {
 		t.Fatalf("Summaries() = %+v, want canonical hostname %q", got, lease.CanonicalHostname)
+	}
+}
+
+func TestReputationRecyclesInactiveIdentitiesAtCapacity(t *testing.T) {
+	store := newTestReputationStore(t)
+	store.state.LastVoteAt = map[string]int64{"id:retained": 1}
+	store.state.Identities["id:retained"] = map[string]string{"saved-voter": VoteDown}
+	for i := range reputationMaxIdentities - 1 {
+		identity := fmt.Sprintf("id:retired-%04d", i)
+		store.state.Identities[identity] = map[string]string{"saved-voter": VoteUp}
+		store.state.LastVoteAt[identity] = int64(i + 2)
+	}
+
+	// Restart from an existing full ledger, then cycle more identities.
+	payload, err := json.Marshal(store.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewReputationStore(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cookie string
+	for i := range 16 {
+		hostname := fmt.Sprintf("new-%d.example.com", i)
+		_, minted, err := store.CastVote(hostname, "id:"+hostname, VoteUp, cookie, netip.MustParseAddr("203.0.113.10"), testLeases("retained", hostname))
+		if err != nil {
+			t.Fatalf("new identity %d: %v", i, err)
+		}
+		if minted != "" {
+			cookie = minted
+		}
+	}
+	if got := len(store.state.Identities); got != reputationMaxIdentities {
+		t.Fatalf("identity count = %d, want %d", got, reputationMaxIdentities)
+	}
+	if got := store.state.Identities["id:retained"]["saved-voter"]; got != VoteDown {
+		t.Fatalf("active identity vote changed to %q", got)
+	}
+	if _, ok := store.state.Identities["id:retired-0000"]; ok {
+		t.Fatal("oldest inactive identity was not reclaimed")
+	}
+	if _, ok := store.state.LastVoteAt["id:retired-0000"]; ok {
+		t.Fatal("reclaimed identity timestamp was not deleted")
+	}
+
+	reloaded, err := NewReputationStore(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.state.Identities["id:retained"]["saved-voter"]; got != VoteDown {
+		t.Fatalf("reloaded active vote = %q", got)
+	}
+	if got := reloaded.state.Identities["id:new-15.example.com"]; len(got) != 1 {
+		t.Fatalf("reloaded new identity votes = %v", got)
+	}
+}
+
+func TestReputationReclaimsLegacyRecordsWithoutTimestamps(t *testing.T) {
+	store := newTestReputationStore(t)
+	for i := range reputationMaxIdentities {
+		store.state.Identities[fmt.Sprintf("id:old-%04d", i)] = map[string]string{"saved-voter": VoteUp}
+	}
+	payload, err := json.Marshal(store.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewReputationStore(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.CastVote("fresh.example.com", "id:fresh.example.com", VoteUp, "", netip.MustParseAddr("203.0.113.10"), testLeases("fresh.example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.state.Identities["id:old-0000"]; ok {
+		t.Fatal("oldest legacy record was not reclaimed")
+	}
+	if _, ok := store.state.LastVoteAt["id:fresh.example.com"]; !ok {
+		t.Fatal("new record is missing its timestamp")
+	}
+}
+
+func TestReputationCapacityDoesNotEvictActiveIdentities(t *testing.T) {
+	store := newTestReputationStore(t)
+	live := make([]types.PolicyLease, 0, reputationMaxIdentities+1)
+	for i := range reputationMaxIdentities {
+		identity := fmt.Sprintf("id:live-%04d", i)
+		store.state.Identities[identity] = map[string]string{"saved-voter": VoteUp}
+		live = append(live, types.PolicyLease{IdentityKey: identity})
+	}
+	live = append(live, types.PolicyLease{IdentityKey: "id:new.example.com"})
+	before, err := json.Marshal(store.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.CastVote("new.example.com", "id:new.example.com", VoteUp, "", netip.MustParseAddr("203.0.113.10"), live)
+	if !errors.Is(err, ErrReputationCapacity) {
+		t.Fatalf("vote error = %v, want capacity error", err)
+	}
+	after, err := json.Marshal(store.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("full live ledger was modified")
+	}
+}
+
+func TestReputationReclaimWriteFailureIsAtomic(t *testing.T) {
+	store := newTestReputationStore(t)
+	for i := range reputationMaxIdentities {
+		store.state.Identities[fmt.Sprintf("id:retired-%04d", i)] = map[string]string{"saved-voter": VoteUp}
+	}
+	before, err := json.Marshal(store.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.path = filepath.Join(t.TempDir(), "occupied")
+	if err := os.Mkdir(store.path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.CastVote("new.example.com", "id:new.example.com", VoteUp, "", netip.MustParseAddr("203.0.113.10"), testLeases("new.example.com"))
+	if err == nil {
+		t.Fatal("expected state file write error")
+	}
+	after, err := json.Marshal(store.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed persistence changed in-memory votes or timestamps")
 	}
 }
