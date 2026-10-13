@@ -3,6 +3,7 @@ package policy
 import (
 	"net/netip"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/gosuda/portal-tunnel/v2/types"
@@ -127,5 +128,32 @@ func TestReputationCookielessIdentitySurvivesRestart(t *testing.T) {
 	summary, again, err := restarted.CastVote("demo.example.com", "id:demo.example.com", VoteDown, "", source)
 	if err != nil || summary.Total != 1 || summary.Down != 1 || again != cookie {
 		t.Fatalf("CastVote(after restart) = %+v, cookie=%q, err=%v, want one updated vote and cookie %q", summary, again, err, cookie)
+	}
+}
+
+
+func TestReputationAtCapacityExistingVoterCanChangeVote(t *testing.T) {
+	store := newTestReputationStore(t)
+	source := netip.MustParseAddr("203.0.113.10")
+	const hostname, identity = "demo.example.com", "id:demo.example.com"
+	_, cookie, err := store.CastVote(hostname, identity, VoteUp, "", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	votes := store.state.Identities[identity]
+	for i := 1; i < reputationMaxVoters; i++ {
+		votes["legacy-"+strconv.Itoa(i)] = VoteUp
+	}
+	updated, _, err := store.CastVote(hostname, identity, VoteDown, "", source)
+	if err != nil || updated.Total != reputationMaxVoters || updated.Down != 1 {
+		t.Fatalf("CastVote(existing voter at capacity) = %+v, err=%v, want one updated vote", updated, err)
+	}
+	otherSource := netip.MustParseAddr("203.0.113.11")
+	if _, _, err := store.CastVote(hostname, identity, VoteUp, "", otherSource); err != ErrReputationCapacity {
+		t.Fatalf("CastVote(new voter at capacity) error = %v, want %v", err, ErrReputationCapacity)
+	}
+	updated, _, err = store.CastVote(hostname, identity, VoteUp, cookie, otherSource)
+	if err != nil || updated.Total != reputationMaxVoters || updated.Down != 0 {
+		t.Fatalf("CastVote(existing cookie at capacity) = %+v, err=%v, want unchanged capacity", updated, err)
 	}
 }
