@@ -97,7 +97,7 @@ type ReverseEndpoint struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 	Overlay    bool      `json:"overlay,omitempty"`
 	// Gateway binds an overlay endpoint to a gateway-signed discovery descriptor.
-	Gateway    *RelayDescriptor `json:"gateway,omitempty"`
+	Gateway *RelayDescriptor `json:"gateway,omitempty"`
 }
 
 type RegisterResponse struct {
