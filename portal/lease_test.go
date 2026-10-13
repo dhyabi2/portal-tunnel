@@ -884,3 +884,26 @@ func TestRegisterChallengeTotalCapacity(t *testing.T) {
 		t.Fatalf("issueRegisterChallenge() after expiry error = %v", err)
 	}
 }
+
+func TestPortPoolImmediateReleaseAfterNormalClose(t *testing.T) {
+	old := &leaseRecord{Identity: types.Identity{Name: "evicted", Address: "0x1"}}
+	pool := newPortPool(10000, 10000, time.Minute)
+	port, err := pool.allocate(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.release(port, old)
+	pool.releaseImmediately(port, old)
+	if len(pool.available) != 1 || pool.available[0] != port || len(pool.reserved) != 0 {
+		t.Fatalf("immediate release did not return port %d", port)
+	}
+
+	next := &leaseRecord{Identity: old.Identity}
+	if allocated, err := pool.allocate(next); err != nil || allocated != port {
+		t.Fatalf("reallocation = %d, %v; want %d, nil", allocated, err, port)
+	}
+	pool.releaseImmediately(port, old)
+	if pool.inUse[port] != next || len(pool.available) != 0 {
+		t.Fatal("stale immediate release reclaimed a different lease's port")
+	}
+}
