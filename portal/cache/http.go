@@ -58,7 +58,8 @@ func (c *Manager) Handle(w http.ResponseWriter, req *http.Request, leaseID strin
 	}
 	controller := http.NewResponseController(w)
 	_ = controller.SetReadDeadline(time.Now().Add(readTimeout))
-	defer controller.SetReadDeadline(time.Time{})
+	// Keep the deadline through the enclosing control-body gate's cleanup,
+	// which closes any unread body before releasing its in-flight slot.
 	var manifest types.StaticCacheManifest
 	var err error
 	var parts *multipart.Reader
