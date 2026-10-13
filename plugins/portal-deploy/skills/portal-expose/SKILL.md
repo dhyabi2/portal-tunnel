@@ -51,7 +51,7 @@ For x402, do not guess the protected path, payment methods, amount, network, rec
 ### 3. Check Portal
 
 - Run `portal version` when `portal` is available.
-- If Portal is missing, present the official GitHub installer and request approval before running it because installation writes outside the project. A relay also serves an installer at `<relay>/api/install.sh` (`install.ps1` on Windows), but the relay then supplies the script, the binary, and the checksum together, so nothing in that download is verified independently of the relay. Use it only when the user explicitly prefers it, and before running the installed binary compare its SHA-256 with the `checksums.txt` or `.sha256` asset of the matching GitHub release, fetched from github.com rather than from the relay. Never run an installer from a relay the user did not choose or from a third-party URL.
+- If Portal is missing, obtain approval and install only from `https://github.com/gosuda/portal-tunnel/releases/latest/download/` (`install.sh` on Unix, `install.ps1` on Windows). Relay URLs belong only in `--relays`; a relay cannot authenticate a binary using its own checksum.
 - Do not assume a hard-coded latest release or stale flags. Use the installed Portal version as the compatibility baseline.
 
 ### 4. Build the Command or Agent Config
