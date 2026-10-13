@@ -21,7 +21,7 @@ describe("tunnelCommand", () => {
 
     expect(command).toBe(
       [
-        `curl -ksSL https://localhost/api/install.sh | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
+        `curl -fsSL https://github.com/gosuda/portal-tunnel/releases/latest/download/install.sh | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
         "portal expose 3000 --name my-app --relays https://localhost",
       ].join("\n")
     );
@@ -43,7 +43,7 @@ describe("tunnelCommand", () => {
     expect(buildTunnelCommand(options)).toBe(
       [
         `$ProgressPreference = 'SilentlyContinue'`,
-        `irm https://relay.example.com/api/install.ps1 | iex`,
+        `irm https://github.com/gosuda/portal-tunnel/releases/latest/download/install.ps1 | iex`,
         `portal expose localhost:3000 --name my-app --relays https://relay.example.com --discovery=false --thumbnail https://example.com/thumb.png`,
       ].join("\n")
     );
@@ -64,7 +64,7 @@ describe("tunnelCommand", () => {
 
     expect(buildTunnelCommand(options)).toBe(
       [
-        `curl -ksSL https://localhost/api/install.sh | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
+        `curl -fsSL https://github.com/gosuda/portal-tunnel/releases/latest/download/install.sh | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
         "portal expose --serve /Users/me/site/main.html --name my-app --relays https://localhost",
       ].join("\n")
     );
@@ -98,6 +98,28 @@ describe("tunnelCommand", () => {
     ).toContain(`portal expose --serve 'C:\\Users\\me\\site\\main.html' --name my-app`);
   });
 
+  it("keeps installation downloads independent of an untrusted relay", () => {
+    const relayOrigin = "https://untrusted-relay.example.com";
+    for (const os of ["unix", "windows"] as const) {
+      const command = buildTunnelCommand({
+        currentOrigin: relayOrigin,
+        target: "3000",
+        name: "demo",
+        relayUrls: [relayOrigin],
+        discovery: true,
+        thumbnailURL: "",
+        os,
+      });
+      const install = command.split("\n").slice(0, os === "windows" ? 2 : 1).join("\n");
+
+      expect(install).toContain(
+        `https://github.com/gosuda/portal-tunnel/releases/latest/download/install.${os === "unix" ? "sh" : "ps1"}`
+      );
+      expect(install).not.toContain(relayOrigin);
+      expect(command).toContain(`--relays ${relayOrigin}`);
+    }
+  });
+
   it("uses the relay root host for preview URLs instead of a placeholder host", () => {
     expect(
       buildTunnelPreviewURL(
@@ -128,7 +150,7 @@ describe("tunnelCommand", () => {
     const command = buildTunnelCommand(options);
     expect(command).toBe(
       [
-        `curl -ksSL https://localhost/api/install.sh | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
+        `curl -fsSL https://github.com/gosuda/portal-tunnel/releases/latest/download/install.sh | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
         "portal expose 3000 --relays https://localhost",
       ].join("\n")
     );
