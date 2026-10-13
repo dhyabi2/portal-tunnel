@@ -2,7 +2,10 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -232,6 +235,58 @@ func TestStaticCacheDoesNotFollowRedirects(t *testing.T) {
 			}
 			if redirected.Load() != 1 || foreignRequests.Load() != 0 {
 				t.Fatalf("redirect requests: configured=%d foreign=%d", redirected.Load(), foreignRequests.Load())
+			}
+		})
+	}
+}
+
+func TestTransientCacheAdmissionFailureDoesNotDeletePublishedSnapshot(t *testing.T) {
+	for _, blockedMethod := range []string{http.MethodPost, http.MethodPut} {
+		t.Run(blockedMethod, func(t *testing.T) {
+			root := t.TempDir()
+			content := []byte("site")
+			if err := os.WriteFile(filepath.Join(root, "index.html"), content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			digest := sha256.Sum256(content)
+			manifest := types.StaticCacheManifest{
+				Index: "index.html",
+				Files: []types.StaticCacheFile{{
+					Path: "index.html", Size: int64(len(content)), SHA256: hex.EncodeToString(digest[:]),
+				}},
+			}
+			var deletes atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deletes.Add(1)
+					utils.WriteAPIData(w, http.StatusOK, types.StaticCacheStatus{})
+					return
+				}
+				if r.Method == blockedMethod {
+					http.Error(w, "cache temporarily unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				if r.Method == http.MethodPost {
+					utils.WriteAPIData(w, http.StatusOK, types.StaticCacheStatus{})
+				}
+			}))
+			defer server.Close()
+			base, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			syncer := &Syncer{
+				relayURL: *base,
+				snapshot: &sourceSnapshot{root: root, manifest: manifest},
+				limits: types.StaticCacheLimits{MaxExposureBytes: 1024, MaxObjectSize: 512},
+			}
+			err = syncer.Sync(context.Background(), server.Client(), "lease-token")
+			var apiErr *types.APIRequestError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("transient rejection = %v", err)
+			}
+			if deletes.Load() != 0 {
+				t.Fatal("transient capacity rejection invalidated a published snapshot")
 			}
 		})
 	}
