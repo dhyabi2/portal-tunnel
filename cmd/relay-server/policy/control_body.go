@@ -81,6 +81,12 @@ func (g *controlBodyGate) wrap(ingress *Ingress, next http.Handler) http.Handler
 		}
 		source := ingress.SourceAddr(r)
 		if !g.acquire(source) {
+			// A rejected request has no in-flight permit. Fail its unread
+			// body immediately so net/http cannot block draining it.
+			if err := http.NewResponseController(w).SetReadDeadline(time.Now()); err != nil {
+				utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeInternal, "control request body deadline unavailable")
+				return
+			}
 			WriteRetryAfter(w, time.Second, "too many active control requests")
 			return
 		}
