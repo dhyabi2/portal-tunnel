@@ -95,7 +95,6 @@ func TestReputationDirectoryPrefersCanonicalHostname(t *testing.T) {
 	}
 }
 
-
 func TestReputationRepeatVoteWithoutCookie(t *testing.T) {
 	store := newTestReputationStore(t)
 	source := netip.MustParseAddr("203.0.113.10")
@@ -113,7 +112,6 @@ func TestReputationRepeatVoteWithoutCookie(t *testing.T) {
 	}
 }
 
-
 func TestReputationCookielessIdentitySurvivesRestart(t *testing.T) {
 	store := newTestReputationStore(t)
 	source := netip.MustParseAddr("203.0.113.10")
@@ -130,7 +128,6 @@ func TestReputationCookielessIdentitySurvivesRestart(t *testing.T) {
 		t.Fatalf("CastVote(after restart) = %+v, cookie=%q, err=%v, want one updated vote and cookie %q", summary, again, err, cookie)
 	}
 }
-
 
 func TestReputationAtCapacityExistingVoterCanChangeVote(t *testing.T) {
 	store := newTestReputationStore(t)
