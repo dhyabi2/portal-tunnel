@@ -123,12 +123,8 @@ func (api *RelayAPI) Handler() *http.ServeMux {
 	mux.HandleFunc(types.PathPolicyPrefix, api.servePolicy)
 	mux.HandleFunc(types.PathState, api.servePublicState)
 	mux.HandleFunc(pathReputationVote, api.serveReputationVote)
-	mux.HandleFunc(types.PathInstallShell, func(w http.ResponseWriter, r *http.Request) {
-		serveInstallScript(w, r, api.server.PortalURL(), false)
-	})
-	mux.HandleFunc(types.PathInstallPowerShell, func(w http.ResponseWriter, r *http.Request) {
-		serveInstallScript(w, r, api.server.PortalURL(), true)
-	})
+	mux.HandleFunc(types.PathInstallShell, serveUnavailableInstallScript)
+	mux.HandleFunc(types.PathInstallPowerShell, serveUnavailableInstallScript)
 	mux.HandleFunc(types.PathInstallBinPrefix, serveInstallBinary)
 	mux.HandleFunc("/", api.serveFrontend)
 
@@ -710,24 +706,15 @@ func serveInstallBinary(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func serveInstallScript(w http.ResponseWriter, r *http.Request, portalURL string, isWindows bool) {
+// Legacy relay installer endpoints must never deliver executable installation
+// code. Only the official release publisher supplies installers.
+func serveUnavailableInstallScript(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodHead)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	script, filename, contentType, err := installer.RelayScript(portalURL, isWindows)
-	if err != nil {
-		http.Error(w, "failed to render install script", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
-	if r.Method == http.MethodGet {
-		_, _ = w.Write([]byte(script))
-	}
+	http.Error(w, "Relay-hosted installers are disabled. Use https://github.com/gosuda/portal-tunnel/releases/latest/download instead.", http.StatusGone)
 }
 
 func serveLLMs(w http.ResponseWriter, r *http.Request, portalURL string) {
