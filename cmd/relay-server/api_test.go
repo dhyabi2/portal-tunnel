@@ -32,6 +32,26 @@ func newTestReputationAPI(t *testing.T) *RelayAPI {
 	return api
 }
 
+func TestRelayLLMsNeverRecommendsRelayHostedInstallers(t *testing.T) {
+	response := httptest.NewRecorder()
+	serveLLMs(response, httptest.NewRequest(http.MethodGet, types.PathLLMs, nil), "https://untrusted-relay.example.com")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	body := response.Body.String()
+	for _, suffix := range []string{"install.sh", "install.ps1"} {
+		if !strings.Contains(body, "https://github.com/gosuda/portal-tunnel/releases/latest/download/"+suffix) {
+			t.Fatalf("missing official %s installer URL", suffix)
+		}
+	}
+	if strings.Contains(body, "https://untrusted-relay.example.com/api/install") {
+		t.Fatal("relay quick-start still runs a relay-hosted installer")
+	}
+	if !strings.Contains(body, "portal expose 3000 --relays https://untrusted-relay.example.com --discovery=false") {
+		t.Fatal("relay selection was lost from the expose command")
+	}
+}
+
 func TestRelayInstallerEndpointsDoNotServeExecutableCode(t *testing.T) {
 	api := newTestReputationAPI(t)
 	for _, path := range []string{types.PathInstallShell, types.PathInstallPowerShell} {
