@@ -6,7 +6,15 @@ import (
 	"time"
 )
 
-const DefaultUDPFlowIdleTimeout = 5 * time.Minute
+const (
+	DefaultUDPFlowIdleTimeout     = 5 * time.Minute
+	MaxDatagramPayloadSize        = 1350
+	DefaultMaxDatagramBufferSize  = 65535
+	DefaultMaxRelayUDPFlows       = 1024
+	DefaultMaxSDKUDPFlows         = 1024
+	DefaultMaxQUICPendingAuth     = 64
+	DefaultQUICControlAuthTimeout = 10 * time.Second
+)
 
 var (
 	errDatagramTooSmall       = errors.New("datagram too small to decode")
@@ -22,6 +30,7 @@ type DatagramFrame struct {
 	Address  string
 	RelayURL string
 	UDPAddr  string
+	LeaseID  string
 }
 
 // EncodeDatagram serialises a flow-framed datagram for transmission.

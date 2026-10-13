@@ -214,7 +214,11 @@ func AcceptQUICBackhaulControl(ctx context.Context, conn *quic.Conn) (*QUICBackh
 		return nil, fmt.Errorf("accept quic backhaul control stream: %w", err)
 	}
 
-	_ = stream.SetReadDeadline(time.Now().Add(quicBackhaulControlTimeout))
+	deadline := time.Now().Add(quicBackhaulControlTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = stream.SetReadDeadline(deadline)
 	var msg quicBackhaulControlMessage
 	if err := json.NewDecoder(io.LimitReader(stream, quicBackhaulControlBodyLimit)).Decode(&msg); err != nil {
 		return nil, fmt.Errorf("read quic backhaul control message: %w", err)

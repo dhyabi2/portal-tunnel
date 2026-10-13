@@ -201,6 +201,8 @@ type Server struct {
 	redirectListener net.Listener
 	redirectServer   *http.Server
 	quicBackhaul     *quic.Listener
+	quicPendingMu    sync.Mutex
+	quicPendingConns map[*quic.Conn]context.CancelFunc
 
 	relaySet *discovery.RelaySet
 	registry *leaseRegistry
@@ -235,9 +237,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	server := &Server{
 		cfg:       utils.NewSnapshot(cfg, ServerConfig.snapshot),
 		identity:  relayIdentity,
-		authority: relayAuthority,
-		registry:  registry,
-		relaySet:  relaySet,
+		authority:        relayAuthority,
+		registry:         registry,
+		relaySet:         relaySet,
+		quicPendingConns: make(map[*quic.Conn]context.CancelFunc),
 	}
 	if cfg.IVNPConfigPath != "" {
 		server.overlay, err = overlay.New(overlay.Config{
@@ -465,7 +468,7 @@ func (s *Server) start(ctx context.Context, apiHandler http.Handler) error {
 	}
 	group.Go(func() error { return s.runPublicIngress(groupCtx) })
 	if s.quicBackhaul != nil {
-		group.Go(s.runQUICBackhaulListener)
+		group.Go(func() error { return s.runQUICBackhaulListener(groupCtx) })
 	}
 	group.Go(func() error { return s.runRegistryJanitor(groupCtx, 5*time.Second) })
 	if cacheManager != nil {
@@ -725,6 +728,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if s.quicBackhaul != nil {
 			_ = s.quicBackhaul.Close()
 		}
+		s.quicPendingMu.Lock()
+		for conn, cancel := range s.quicPendingConns {
+			cancel()
+			_ = conn.CloseWithError(0, "server shutdown")
+			delete(s.quicPendingConns, conn)
+		}
+		s.quicPendingMu.Unlock()
 		if s.apiHandoff != nil {
 			_ = s.apiHandoff.Close()
 		}
@@ -916,24 +926,50 @@ func (s *Server) newQUICBackhaulListener(apiTLS *tls.Config) (*quic.Listener, er
 	return transport.ListenQUICBackhaul(s.config().SNIListenAddr, apiTLS.Certificates[0])
 }
 
-func (s *Server) runQUICBackhaulListener() error {
+func (s *Server) runQUICBackhaulListener(ctx context.Context) error {
 	if s.quicBackhaul == nil {
 		return nil
 	}
 	for {
-		conn, err := s.quicBackhaul.Accept(context.Background())
+		conn, err := s.quicBackhaul.Accept(ctx)
 		if err != nil {
-			if errors.Is(err, quic.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, quic.ErrServerClosed) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
 			}
 			return err
 		}
-		go s.handleQUICBackhaulConn(conn)
+		if !s.admitPendingQUICConn(ctx, conn) {
+			_ = conn.CloseWithError(1, "pending authentication capacity exceeded")
+			continue
+		}
 	}
 }
 
-func (s *Server) handleQUICBackhaulConn(conn *quic.Conn) {
-	control, err := transport.AcceptQUICBackhaulControl(context.Background(), conn)
+func (s *Server) admitPendingQUICConn(parentCtx context.Context, conn *quic.Conn) bool {
+	s.quicPendingMu.Lock()
+	if len(s.quicPendingConns) >= types.DefaultMaxQUICPendingAuth {
+		s.quicPendingMu.Unlock()
+		return false
+	}
+	authCtx, cancel := context.WithTimeout(parentCtx, types.DefaultQUICControlAuthTimeout)
+	s.quicPendingConns[conn] = cancel
+	s.quicPendingMu.Unlock()
+
+	go s.handleQUICBackhaulConn(authCtx, conn)
+	return true
+}
+
+func (s *Server) handleQUICBackhaulConn(ctx context.Context, conn *quic.Conn) {
+	defer func() {
+		s.quicPendingMu.Lock()
+		if cancel, ok := s.quicPendingConns[conn]; ok {
+			delete(s.quicPendingConns, conn)
+			cancel()
+		}
+		s.quicPendingMu.Unlock()
+	}()
+
+	control, err := transport.AcceptQUICBackhaulControl(ctx, conn)
 	if err != nil {
 		_ = conn.CloseWithError(1, "control read failed")
 		return

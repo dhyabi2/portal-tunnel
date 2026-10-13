@@ -6,6 +6,8 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -386,6 +388,7 @@ type listenerSnapshot struct {
 	udpAddr       string
 	tcpAddr       string
 	accessToken   string
+	leaseID       string
 	reverse       types.ReverseEndpoint
 	expiresAt     time.Time
 	tenantTLS     *keyless.Client
@@ -467,6 +470,7 @@ func (l *listener) acceptDatagram() (types.DatagramFrame, error) {
 	frame.Payload = bytes.Clone(frame.Payload)
 	if lease, ok := l.leaseSnapshot(); ok {
 		frame.UDPAddr = lease.udpAddr
+		frame.LeaseID = lease.leaseID
 	}
 	frame.Address = l.identity.Address
 	if l.api != nil && l.api.relayURL != nil {
@@ -485,6 +489,11 @@ func (l *listener) sendDatagram(frame types.DatagramFrame) error {
 	}
 	if frameAddress := strings.TrimSpace(frame.Address); frameAddress != "" && frameAddress != l.identity.Address {
 		return errors.New("datagram frame targets stale address")
+	}
+	if lease, ok := l.leaseSnapshot(); ok {
+		if frame.LeaseID != "" && lease.leaseID != "" && frame.LeaseID != lease.leaseID {
+			return errors.New("datagram frame targets stale lease")
+		}
 	}
 	return l.datagram.Send(frame.FlowID, frame.Payload)
 }
@@ -1101,12 +1110,14 @@ func (l *listener) registerAndConfigure(ctx context.Context) error {
 		_ = tenantTLS.Close()
 		return ctx.Err()
 	}
+	leaseID := extractLeaseID(resp.AccessToken)
 	next := listenerSnapshot{
 		hostname:      canonicalHostname,
 		aliasHostname: resp.Hostname,
 		udpAddr:       resp.UDPAddr,
 		tcpAddr:       resp.TCPAddr,
 		accessToken:   resp.AccessToken,
+		leaseID:       leaseID,
 		reverse:       resp.ReverseEndpoint,
 		expiresAt:     resp.ExpiresAt,
 		tenantTLS:     tenantTLS,
@@ -1114,6 +1125,11 @@ func (l *listener) registerAndConfigure(ctx context.Context) error {
 	oldLease := l.lease.Swap(next)
 	if oldLease.tenantTLS != nil {
 		_ = oldLease.tenantTLS.Close()
+	}
+	if oldLease.leaseID != "" && oldLease.leaseID != next.leaseID {
+		if l.udpEnabled && l.datagram != nil {
+			l.datagram.Drain()
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		lease := l.clearLease("registration canceled")
@@ -1131,6 +1147,22 @@ func (l *listener) registerAndConfigure(ctx context.Context) error {
 		l.datagram.Clear("lease updated")
 	}
 	return nil
+}
+
+func extractLeaseID(token string) string {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) >= 2 {
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err == nil {
+			var claims struct {
+				LeaseID string `json:"lease_id"`
+			}
+			if err := json.Unmarshal(payload, &claims); err == nil && claims.LeaseID != "" {
+				return claims.LeaseID
+			}
+		}
+	}
+	return token
 }
 
 func (l *listener) waitRetry(ctx context.Context, operation string, err error, retries, reverseSessionSlot int) bool {

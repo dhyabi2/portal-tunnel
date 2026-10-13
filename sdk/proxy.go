@@ -291,6 +291,7 @@ func proxyExposureDatagrams(ctx context.Context, exposure *Exposure, localAddr s
 	}
 
 	mgr := newUDPFlowManager(resolvedAddr, exposure)
+	defer mgr.Close()
 	go mgr.runCleanup(ctx)
 
 	log.Info().Str("target", localAddr).Msg("udp proxy loop started, waiting for datagrams")
@@ -339,10 +340,13 @@ func proxyExposureDatagrams(ctx context.Context, exposure *Exposure, localAddr s
 	return nil
 }
 
+var errFlowLimitExceeded = errors.New("udp flow limit exceeded")
+
 type udpFlowKey struct {
 	flowID   uint32
 	address  string
 	relayURL string
+	leaseID  string
 }
 
 type udpFlowEntry struct {
@@ -352,29 +356,63 @@ type udpFlowEntry struct {
 }
 
 type udpFlowManager struct {
-	target   *net.UDPAddr
-	exposure *Exposure
-	mu       sync.Mutex
-	flows    map[udpFlowKey]*udpFlowEntry
+	target       *net.UDPAddr
+	exposure     *Exposure
+	mu           sync.Mutex
+	flows        map[udpFlowKey]*udpFlowEntry
+	activeLeases map[string]string
+	maxFlows     int
+	closed       bool
+	wg           sync.WaitGroup
 }
 
 func newUDPFlowManager(target *net.UDPAddr, exposure *Exposure) *udpFlowManager {
 	return &udpFlowManager{
-		target:   target,
-		exposure: exposure,
-		flows:    make(map[udpFlowKey]*udpFlowEntry),
+		target:       target,
+		exposure:     exposure,
+		flows:        make(map[udpFlowKey]*udpFlowEntry),
+		activeLeases: make(map[string]string),
+		maxFlows:     types.DefaultMaxSDKUDPFlows,
 	}
 }
 
+func (m *udpFlowManager) Close() {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		m.wg.Wait()
+		return
+	}
+	m.closed = true
+	for key, f := range m.flows {
+		_ = f.conn.Close()
+		delete(m.flows, key)
+	}
+	m.mu.Unlock()
+	m.wg.Wait()
+}
+
 func (m *udpFlowManager) runCleanup(ctx context.Context) {
+	m.wg.Add(1)
+	defer m.wg.Done()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			m.mu.Lock()
+			for key, f := range m.flows {
+				_ = f.conn.Close()
+				delete(m.flows, key)
+			}
+			m.mu.Unlock()
 			return
 		case <-ticker.C:
 			m.mu.Lock()
+			if m.closed {
+				m.mu.Unlock()
+				return
+			}
 			now := time.Now()
 			for key, f := range m.flows {
 				if now.Sub(f.lastSeen) > types.DefaultUDPFlowIdleTimeout {
@@ -392,13 +430,40 @@ func (m *udpFlowManager) getOrCreate(ctx context.Context, frame types.DatagramFr
 		flowID:   frame.FlowID,
 		address:  frame.Address,
 		relayURL: frame.RelayURL,
+		leaseID:  frame.LeaseID,
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, net.ErrClosed
+	}
 	if f, ok := m.flows[key]; ok {
 		f.lastSeen = time.Now()
 		m.mu.Unlock()
 		return f.conn, nil
+	}
+
+	if frame.LeaseID != "" {
+		targetKey := frame.Address + "@" + frame.RelayURL
+		if curLease, exists := m.activeLeases[targetKey]; exists && curLease != frame.LeaseID {
+			for k, f := range m.flows {
+				if k.address == frame.Address && k.relayURL == frame.RelayURL && k.leaseID == curLease {
+					_ = f.conn.Close()
+					delete(m.flows, k)
+				}
+			}
+		}
+		m.activeLeases[targetKey] = frame.LeaseID
+	}
+
+	maxFlows := m.maxFlows
+	if maxFlows <= 0 {
+		maxFlows = types.DefaultMaxSDKUDPFlows
+	}
+	if len(m.flows) >= maxFlows {
+		m.mu.Unlock()
+		return nil, errFlowLimitExceeded
 	}
 	m.mu.Unlock()
 
@@ -408,11 +473,21 @@ func (m *udpFlowManager) getOrCreate(ctx context.Context, frame types.DatagramFr
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_ = localConn.Close()
+		return nil, net.ErrClosed
+	}
 	if f, ok := m.flows[key]; ok {
 		m.mu.Unlock()
 		_ = localConn.Close()
 		f.lastSeen = time.Now()
 		return f.conn, nil
+	}
+	if len(m.flows) >= maxFlows {
+		m.mu.Unlock()
+		_ = localConn.Close()
+		return nil, errFlowLimitExceeded
 	}
 	m.flows[key] = &udpFlowEntry{
 		conn:     localConn,
@@ -422,21 +497,26 @@ func (m *udpFlowManager) getOrCreate(ctx context.Context, frame types.DatagramFr
 			Address:  frame.Address,
 			RelayURL: frame.RelayURL,
 			UDPAddr:  frame.UDPAddr,
+			LeaseID:  frame.LeaseID,
 		},
 	}
+	m.wg.Add(1)
 	m.mu.Unlock()
 
-	go m.readLoop(ctx, key, localConn)
+	go func() {
+		defer m.wg.Done()
+		m.readLoop(ctx, key, localConn)
+	}()
 	return localConn, nil
 }
 
-func (m *udpFlowManager) removeFlow(key udpFlowKey) {
+func (m *udpFlowManager) removeFlowIfConn(key udpFlowKey, conn *net.UDPConn) {
 	m.mu.Lock()
-	if f, ok := m.flows[key]; ok {
+	defer m.mu.Unlock()
+	if f, ok := m.flows[key]; ok && f.conn == conn {
 		_ = f.conn.Close()
 		delete(m.flows, key)
 	}
-	m.mu.Unlock()
 }
 
 func (m *udpFlowManager) readLoop(ctx context.Context, key udpFlowKey, conn *net.UDPConn) {
@@ -453,13 +533,13 @@ func (m *udpFlowManager) readLoop(ctx context.Context, key udpFlowKey, conn *net
 				Str("address", key.address).
 				Str("relay_url", key.relayURL).
 				Msg("local read ended")
-			m.removeFlow(key)
+			m.removeFlowIfConn(key, conn)
 			return
 		}
 
 		m.mu.Lock()
 		entry := m.flows[key]
-		if entry == nil {
+		if entry == nil || entry.conn != conn {
 			m.mu.Unlock()
 			return
 		}
@@ -475,7 +555,7 @@ func (m *udpFlowManager) readLoop(ctx context.Context, key udpFlowKey, conn *net
 				Str("address", key.address).
 				Str("relay_url", key.relayURL).
 				Msg("send datagram to relay failed")
-			m.removeFlow(key)
+			m.removeFlowIfConn(key, conn)
 			return
 		}
 	}

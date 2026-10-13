@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -16,7 +17,7 @@ import (
 )
 
 const (
-	defaultMaxPacketSize       = 1350
+	defaultMaxPacketSize       = types.MaxDatagramPayloadSize
 	defaultFlowCleanupInterval = 30 * time.Second
 )
 
@@ -33,6 +34,7 @@ type RelayDatagram struct {
 	flowTable   map[uint32]*flowState
 	addrIndex   map[netip.AddrPort]uint32
 	nextFlow    uint32
+	maxFlows    int
 	enabled     atomic.Bool
 
 	conn *net.UDPConn
@@ -49,6 +51,7 @@ func NewRelayDatagram(identityKey types.ServiceIdentityKey, port int) *RelayData
 		flowTable:   make(map[uint32]*flowState),
 		addrIndex:   make(map[netip.AddrPort]uint32),
 		nextFlow:    1,
+		maxFlows:    types.DefaultMaxRelayUDPFlows,
 	}
 }
 
@@ -130,7 +133,7 @@ func (d *RelayDatagram) sendDatagram(flowID uint32, payload []byte) error {
 	return d.session.Send(flowID, payload)
 }
 
-func (d *RelayDatagram) touchFlow(addr netip.AddrPort) uint32 {
+func (d *RelayDatagram) touchFlow(addr netip.AddrPort) (uint32, bool, bool) {
 	now := time.Now()
 
 	d.mu.Lock()
@@ -139,19 +142,41 @@ func (d *RelayDatagram) touchFlow(addr netip.AddrPort) uint32 {
 	if id, ok := d.addrIndex[addr]; ok {
 		if flow, exists := d.flowTable[id]; exists && flow != nil {
 			flow.lastSeen = now
-			return id
+			return id, false, true
 		}
 		delete(d.addrIndex, addr)
 	}
 
-	id := d.nextFlow
-	d.nextFlow++
-	d.flowTable[id] = &flowState{
-		addr:     addr,
-		lastSeen: now,
+	if !d.session.Connected() {
+		return 0, false, false
 	}
-	d.addrIndex[addr] = id
-	return id
+	maxFlows := d.maxFlows
+	if maxFlows <= 0 {
+		maxFlows = types.DefaultMaxRelayUDPFlows
+	}
+	if len(d.flowTable) >= maxFlows {
+		return 0, false, false
+	}
+
+	for attempts := 0; attempts < maxFlows+1; attempts++ {
+		id := d.nextFlow
+		d.nextFlow++
+		if d.nextFlow == 0 {
+			d.nextFlow = 1
+		}
+		if id == 0 {
+			continue
+		}
+		if _, exists := d.flowTable[id]; !exists {
+			d.flowTable[id] = &flowState{
+				addr:     addr,
+				lastSeen: now,
+			}
+			d.addrIndex[addr] = id
+			return id, true, true
+		}
+	}
+	return 0, false, false
 }
 
 func (d *RelayDatagram) UDPPort() int {
@@ -200,7 +225,7 @@ func (d *RelayDatagram) dispatch(frame types.DatagramFrame) {
 		return
 	}
 	if _, err := conn.WriteToUDPAddrPort(frame.Payload, addr); err != nil {
-		log.Warn().
+		log.Debug().
 			Err(err).
 			Str("component", "udp-relay").
 			Str("identity_key", d.identityKey.String()).
@@ -252,13 +277,27 @@ func (d *RelayDatagram) forgetFlow(flowID uint32) {
 	delete(d.flowTable, flowID)
 }
 
+func isMessageSizeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.EMSGSIZE || errno == 10040
+	}
+	return false
+}
+
 func (d *RelayDatagram) readLoop() {
-	buf := make([]byte, defaultMaxPacketSize)
+	buf := make([]byte, types.DefaultMaxDatagramBufferSize)
 	for {
 		n, clientAddr, err := d.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
+			}
+			if isMessageSizeErr(err) {
+				continue
 			}
 			log.Warn().
 				Str("component", "udp-relay").
@@ -270,13 +309,22 @@ func (d *RelayDatagram) readLoop() {
 		if !d.enabled.Load() {
 			continue
 		}
+		if n > types.MaxDatagramPayloadSize {
+			continue
+		}
 
-		flowID := d.touchFlow(clientAddr)
+		flowID, isNew, ok := d.touchFlow(clientAddr)
+		if !ok {
+			continue
+		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 
 		if err := d.sendDatagram(flowID, payload); err != nil {
-			log.Warn().
+			if isNew {
+				d.forgetFlow(flowID)
+			}
+			log.Debug().
 				Str("component", "udp-relay").
 				Str("identity_key", d.identityKey.String()).
 				Err(err).

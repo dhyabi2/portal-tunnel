@@ -871,15 +871,30 @@ func (e *Exposure) AcceptDatagram() (types.DatagramFrame, error) {
 	if !e.options.UDPEnabled {
 		return types.DatagramFrame{}, net.ErrClosed
 	}
-	select {
-	case frame := <-e.datagrams:
-		return frame, nil
-	default:
-	}
-	select {
-	case <-e.done:
-		return types.DatagramFrame{}, net.ErrClosed
-	case frame := <-e.datagrams:
+	for {
+		var frame types.DatagramFrame
+		select {
+		case frame = <-e.datagrams:
+		default:
+			select {
+			case <-e.done:
+				return types.DatagramFrame{}, net.ErrClosed
+			case frame = <-e.datagrams:
+			}
+		}
+
+		if frame.LeaseID != "" && frame.RelayURL != "" {
+			e.mu.RLock()
+			listener := e.relayListeners[frame.RelayURL]
+			e.mu.RUnlock()
+			if listener != nil {
+				if lease, ok := listener.leaseSnapshot(); ok {
+					if lease.leaseID != "" && frame.LeaseID != lease.leaseID {
+						continue
+					}
+				}
+			}
+		}
 		return frame, nil
 	}
 }

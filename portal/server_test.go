@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/quic-go/quic-go"
 
 	"github.com/gosuda/portal-tunnel/v2/portal/transport"
 	"github.com/gosuda/portal-tunnel/v2/types"
@@ -231,4 +232,37 @@ func newConnectTestRelay(t *testing.T) (*Server, *url.URL, string) {
 
 func wsURL(relayURL *url.URL) string {
 	return strings.Replace(relayURL.String(), "http://", "ws://", 1)
+}
+
+func TestServerQUICPendingAuthCapacity(t *testing.T) {
+	server := &Server{
+		quicPendingConns: make(map[*quic.Conn]context.CancelFunc),
+	}
+
+	ctx := context.Background()
+	conns := make([]*quic.Conn, types.DefaultMaxQUICPendingAuth)
+	for i := range conns {
+		conns[i] = &quic.Conn{}
+		if !server.admitPendingQUICConn(ctx, conns[i]) {
+			t.Fatalf("expected conn %d to be admitted within capacity", i)
+		}
+	}
+
+	// Next conn exceeds capacity
+	overflowConn := &quic.Conn{}
+	if server.admitPendingQUICConn(ctx, overflowConn) {
+		t.Fatal("expected pending QUIC conn to be rejected when capacity is full")
+	}
+
+	// Release one
+	server.quicPendingMu.Lock()
+	cancel := server.quicPendingConns[conns[0]]
+	delete(server.quicPendingConns, conns[0])
+	cancel()
+	server.quicPendingMu.Unlock()
+
+	// Now it should be admitted
+	if !server.admitPendingQUICConn(ctx, overflowConn) {
+		t.Fatal("expected pending QUIC conn to be admitted after capacity freed")
+	}
 }

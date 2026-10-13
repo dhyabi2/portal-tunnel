@@ -101,6 +101,17 @@ func (s *DatagramSession) Send(flowID uint32, payload []byte) error {
 	return conn.SendDatagram(types.EncodeDatagram(flowID, payload))
 }
 
+// Drain discards all buffered frames currently queued in incoming.
+func (s *DatagramSession) Drain() {
+	for {
+		select {
+		case <-s.incoming:
+		default:
+			return
+		}
+	}
+}
+
 // Clear closes the active connection but keeps the session reusable.
 func (s *DatagramSession) Clear(reason string) {
 	s.mu.Lock()
@@ -111,6 +122,7 @@ func (s *DatagramSession) Clear(reason string) {
 	if conn != nil {
 		_ = conn.CloseWithError(0, reason)
 	}
+	s.Drain()
 }
 
 // Close permanently closes the session and any active connection.
