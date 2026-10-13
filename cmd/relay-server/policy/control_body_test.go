@@ -59,6 +59,7 @@ func TestControlBodyGuardTargetsJSONControlRoutes(t *testing.T) {
 		types.PathSDKReverse, types.PathSDKUnregister, types.PathDiscoveryAnnounce,
 		types.PathV1Sign, types.PathAdminAuthLogin, types.PathPolicy,
 		types.PathPolicyLeases, types.PathPolicy + "/",
+		types.PathSDKCache, types.PathSDKConnect,
 		types.PathAPIPrefix + "/reputation/vote", types.PathAPIPrefix + "/x402/verify",
 	} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
@@ -67,10 +68,6 @@ func TestControlBodyGuardTargetsJSONControlRoutes(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct{ method, path string }{
-		{http.MethodGet, types.PathSDKConnect},
-		{http.MethodPost, types.PathSDKConnect},
-		{http.MethodPost, types.PathSDKCache},
-		{http.MethodPut, types.PathSDKCache},
 		{http.MethodPost, "/application/upload"},
 		{http.MethodPost, "/api/unrecognized"},
 	} {
@@ -81,6 +78,9 @@ func TestControlBodyGuardTargetsJSONControlRoutes(t *testing.T) {
 	}
 	if isControlBodyRequest(httptest.NewRequest(http.MethodPost, types.PathSDKRegister, nil)) {
 		t.Fatal("bodyless request must not occupy a body slot")
+	}
+	if isControlBodyRequest(httptest.NewRequest(http.MethodGet, types.PathSDKConnect, nil)) {
+		t.Fatal("valid reverse upgrade must not receive a body deadline")
 	}
 }
 
