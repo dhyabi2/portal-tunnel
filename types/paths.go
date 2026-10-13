@@ -13,10 +13,10 @@ const (
 	PathAdminLogout     = PathAdmin + "/auth/logout"
 	PathAdminAuthStatus = PathAdmin + "/auth/status"
 
-	PathPolicy       = PathAPIPrefix + "/policy"
-	PathPolicyPrefix = PathPolicy + "/"
-	PathPolicyState  = PathPolicy + "/state"
-	PathPolicyLeases = PathPolicy + "/leases"
+	PathPolicy           = PathAPIPrefix + "/policy"
+	PathPolicyPrefix     = PathPolicy + "/"
+	PathPolicyState      = PathPolicy + "/state"
+	PathPolicyLeases     = PathPolicy + "/leases"
 	PathPolicyLeaseEvict = PathPolicyLeases + "/evict"
 
 	PathInstallShell      = PathAPIPrefix + "/install.sh"
