@@ -678,6 +678,21 @@ func (s *Server) PolicyLeases() []types.PolicyLease {
 	return s.registry.PolicyLeases(time.Now())
 }
 
+// EvictLease removes a live lease immediately and queues cleanup of its DNS.
+func (s *Server) EvictLease(key types.ServiceIdentityKey) bool {
+	if s == nil || s.registry == nil {
+		return false
+	}
+	record := s.registry.EvictLease(key)
+	if record == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultClaimTimeout)
+	defer cancel()
+	s.deleteLeaseDNS(ctx, record)
+	return true
+}
+
 // AccessProjectionKeys returns identities whose live lease or retained cache
 // content needs the relay's current access decision.
 func (s *Server) AccessProjectionKeys() []types.ServiceIdentityKey {
