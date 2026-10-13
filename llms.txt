@@ -9,14 +9,14 @@ This Portal relay is available at %s.
 Install the Portal CLI and expose a local HTTP service through only this relay:
 
 ~~~bash
-curl -fsSL %s/api/install.sh | bash
+curl -fsSL https://github.com/gosuda/portal-tunnel/releases/latest/download/install.sh | bash
 portal expose 3000 --relays %s --discovery=false
 ~~~
 
 On Windows PowerShell:
 
 ~~~powershell
-irm %s/api/install.ps1 | iex
+irm https://github.com/gosuda/portal-tunnel/releases/latest/download/install.ps1 | iex
 portal expose 3000 --relays %s --discovery=false
 ~~~
 
