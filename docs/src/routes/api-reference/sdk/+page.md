@@ -84,6 +84,10 @@ which are configured locally by the tunnel process.
 
 Cache opt-in is incompatible with raw TCP/UDP leases.
 
+Lease metadata is limited to 16 KiB of retained string data and tag headers,
+with at most 64 tags. Oversized metadata is rejected with HTTP 400 during
+registration challenge issuance, registration, or renewal.
+
 Relays accept at most 4,096 simultaneous live leases (128 per source IP) and
 2,048 outstanding registration challenges. Capacity denials return HTTP 429
 (`rate_limited`). Expired leases and challenges free slots; admins can evict

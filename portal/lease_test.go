@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -905,5 +906,49 @@ func TestPortPoolImmediateReleaseAfterNormalClose(t *testing.T) {
 	pool.releaseImmediately(port, old)
 	if pool.inUse[port] != next || len(pool.available) != 0 {
 		t.Fatal("stale immediate release reclaimed a different lease's port")
+	}
+}
+
+func TestLeaseMetadataBoundsProtectRegistrationAndRenewal(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	source := netip.MustParseAddr("203.0.113.42")
+	request := types.RegisterChallengeRequest{
+		Identity: newTestLeaseIdentity(t, "metadata-limit"),
+		Metadata: types.LeaseMetadata{Description: strings.Repeat("x", maxLeaseMetadataBytes+1)},
+	}
+	for _, oversized := range []types.LeaseMetadata{
+		request.Metadata,
+		{Tags: make([]string, maxLeaseMetadataTags+1)},
+	} {
+		request.Metadata = oversized
+		if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, source); !errors.Is(err, errLeaseMetadataExceeded) {
+			t.Fatalf("issueRegisterChallenge() oversized metadata error = %v", err)
+		}
+		if _, _, err := registry.Register(request, source, "", types.RelayDescriptor{}, nil); !errors.Is(err, errLeaseMetadataExceeded) {
+			t.Fatalf("Register() oversized metadata error = %v", err)
+		}
+		if len(registry.records) != 0 {
+			t.Fatal("rejected metadata created a retained registry record")
+		}
+	}
+
+	request.Metadata = types.LeaseMetadata{Description: strings.Repeat("x", maxLeaseMetadataBytes)}
+	record, response, err := registry.Register(request, source, "", types.RelayDescriptor{}, nil)
+	if err != nil {
+		t.Fatalf("Register() with maximum metadata size: %v", err)
+	}
+	originalExpiry := record.ExpiresAt
+	for _, oversized := range []types.LeaseMetadata{
+		{Description: strings.Repeat("x", maxLeaseMetadataBytes+1)},
+		{Tags: make([]string, maxLeaseMetadataTags+1)},
+	} {
+		if _, _, err := registry.Renew(types.RenewRequest{AccessToken: response.AccessToken, Metadata: oversized}, source); !errors.Is(err, errLeaseMetadataExceeded) {
+			t.Fatalf("Renew() oversized metadata error = %v", err)
+		}
+		if !record.ExpiresAt.Equal(originalExpiry) || record.Metadata.Description != request.Metadata.Description {
+			t.Fatal("rejected renewal changed expiry or metadata")
+		}
 	}
 }

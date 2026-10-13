@@ -25,6 +25,8 @@ import (
 const (
 	defaultLeaseTTL                          = 2 * time.Minute
 	maxLeaseTTL                              = 10 * time.Minute
+	maxLeaseMetadataBytes                    = 16 << 10
+	maxLeaseMetadataTags                     = 64
 	maxLiveLeases                            = 4096
 	maxLiveLeasesPerSource                   = 128
 	maxPendingRegisterChallenges            = 2048
@@ -45,6 +47,22 @@ func requestedLeaseTTL(seconds int) (time.Duration, error) {
 		return 0, errLeaseTTLExceeded
 	}
 	return time.Duration(seconds) * time.Second, nil
+}
+
+// validateLeaseMetadata bounds retained user-controlled strings and slice
+// headers for both pending registration challenges and live leases.
+func validateLeaseMetadata(metadata types.LeaseMetadata) error {
+	if len(metadata.Tags) > maxLeaseMetadataTags {
+		return errLeaseMetadataExceeded
+	}
+	size := len(metadata.Description) + len(metadata.Owner) + len(metadata.Thumbnail) + len(metadata.Tags)*16
+	for _, tag := range metadata.Tags {
+		size += len(tag)
+	}
+	if size > maxLeaseMetadataBytes {
+		return errLeaseMetadataExceeded
+	}
+	return nil
 }
 
 type leaseRegistry struct {
@@ -303,6 +321,9 @@ func (r *leaseRegistry) Register(req types.RegisterChallengeRequest, sourceAddr 
 
 	ttl, err := requestedLeaseTTL(req.TTL)
 	if err != nil {
+		return nil, types.RegisterResponse{}, err
+	}
+	if err := validateLeaseMetadata(req.Metadata); err != nil {
 		return nil, types.RegisterResponse{}, err
 	}
 
@@ -570,6 +591,9 @@ func (r *leaseRegistry) Renew(req types.RenewRequest, sourceAddr netip.Addr) (ty
 	if err != nil {
 		return types.RenewResponse{}, reverseEndpointInput{}, err
 	}
+	if err := validateLeaseMetadata(req.Metadata); err != nil {
+		return types.RenewResponse{}, reverseEndpointInput{}, err
+	}
 
 	leaseKey := claims.Identity.ServiceKey()
 	reportedIP := utils.SanitizeReportedIP(req.ReportedIP)
@@ -741,6 +765,9 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 		return types.RegisterChallengeResponse{}, errFeatureUnavailable
 	}
 	if _, err := requestedLeaseTTL(req.TTL); err != nil {
+		return types.RegisterChallengeResponse{}, err
+	}
+	if err := validateLeaseMetadata(req.Metadata); err != nil {
 		return types.RegisterChallengeResponse{}, err
 	}
 
