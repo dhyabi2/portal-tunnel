@@ -60,6 +60,8 @@ func TestControlBodyGuardTargetsJSONControlRoutes(t *testing.T) {
 		types.PathV1Sign, types.PathAdminAuthLogin, types.PathPolicy,
 		types.PathPolicyLeases, types.PathPolicy + "/",
 		types.PathSDKCache, types.PathSDKConnect,
+		types.PathHealthz, types.PathSDKDomain, types.PathDiscovery,
+		types.PathAPIPrefix + "/unrecognized",
 		types.PathAPIPrefix + "/reputation/vote", types.PathAPIPrefix + "/x402/verify",
 	} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
@@ -69,7 +71,8 @@ func TestControlBodyGuardTargetsJSONControlRoutes(t *testing.T) {
 	}
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodPost, "/application/upload"},
-		{http.MethodPost, "/api/unrecognized"},
+		{http.MethodPost, "/apiary/upload"},
+		{http.MethodPost, "/sdk-v2/upload"},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{"))
 		if isControlBodyRequest(req) {
