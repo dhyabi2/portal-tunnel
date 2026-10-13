@@ -108,10 +108,10 @@ func (s *ReputationStore) AllowVote(source netip.Addr) time.Duration {
 	return retry
 }
 
-// CastVote resolves the voter (minting a cookieless identity when needed),
+// CastVote resolves a signed cookie or a stable source-bound voter identity,
 // applies the vote, and persists atomically under one lock. The returned
-// mint value is a fresh cookie value, set only when a new voter was minted.
-// The identity comes from the relay's current public leases.
+// cookie is reissued for requests without a valid cookie, but never creates
+// another voter for the same source. Identity comes from public leases.
 func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, source netip.Addr) (ReputationSummary, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -162,8 +162,8 @@ func (s *ReputationStore) Summaries(viewerHash string, leases []types.PolicyLeas
 }
 
 // ViewerHashFor resolves a cookie to its voter digest for read paths. A
-// forged or malformed cookie reads as anonymous; the cookieless mint path
-// exists only on votes.
+// forged or malformed cookie reads as anonymous; source-derived identities
+// are issued only on votes.
 func (s *ReputationStore) ViewerHashFor(cookieID string) string {
 	if cookieID == "" {
 		return ""
@@ -175,21 +175,23 @@ func (s *ReputationStore) ViewerHashFor(cookieID string) string {
 	return hash
 }
 
-// resolveVoterLocked returns the digest for a verified cookie or mints a new
-// cookieless identity. Signed cookies need no persisted global voter registry.
+// resolveVoterLocked returns the digest of a verified cookie or derives one
+// deterministically from the trusted client source. A caller that drops every
+// Set-Cookie header cannot create unlimited distinct voter identities.
+// Without accounts, clients behind the same public IP share this identity.
 func (s *ReputationStore) resolveVoterLocked(cookieID string, source netip.Addr) (hash, minted string, err error) {
 	if cookieID != "" {
 		if verified, ok := s.verifyVoter(cookieID); ok {
 			return verified, "", nil
 		}
 	}
-	if retry, _ := s.limiter.Allow(source, 10); retry > 0 {
+	if !source.IsValid() {
 		return "", "", ErrReputationCapacity
 	}
-	id := make([]byte, reputationVoterIDBytes)
-	if _, err := rand.Read(id); err != nil {
-		return "", "", fmt.Errorf("generate voter id: %w", err)
-	}
+	sourceMAC := hmac.New(sha256.New, s.secret)
+	_, _ = sourceMAC.Write([]byte("reputation-source-v1\x00"))
+	_, _ = sourceMAC.Write(source.Unmap().AsSlice())
+	id := sourceMAC.Sum(nil)
 	digest := s.voterMAC(id)
 	hash = hex.EncodeToString(digest)
 	return hash, base64.RawURLEncoding.EncodeToString(append(id, digest...)), nil
