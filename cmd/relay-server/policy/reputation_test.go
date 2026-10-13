@@ -93,3 +93,21 @@ func TestReputationDirectoryPrefersCanonicalHostname(t *testing.T) {
 		t.Fatalf("Summaries() = %+v, want canonical hostname %q", got, lease.CanonicalHostname)
 	}
 }
+
+
+func TestReputationRepeatVoteWithoutCookie(t *testing.T) {
+	store := newTestReputationStore(t)
+	source := netip.MustParseAddr("203.0.113.10")
+	var firstCookie string
+	for i := range 3 {
+		summary, cookie, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteUp, "", source)
+		if err != nil || summary.Total != 1 || cookie == "" {
+			t.Fatalf("CastVote(repeat=%d) = %+v, cookie=%q, err=%v, want one vote and cookie", i, summary, cookie, err)
+		}
+		if i == 0 {
+			firstCookie = cookie
+		} else if cookie != firstCookie {
+			t.Fatalf("CastVote(repeat=%d) cookie = %q, want %q", i, cookie, firstCookie)
+		}
+	}
+}
