@@ -24,12 +24,11 @@ $ProgressPreference = 'SilentlyContinue'
 irm https://github.com/gosuda/portal-tunnel/releases/latest/download/install.ps1 | iex
 ```
 
-### From A Relay
-
-If your relay publishes its own installer:
+Relay servers are transport providers, not software publishers. Download the installer
+from the official GitHub release above, then select a relay using `--relays`:
 
 ```bash
-curl -sSL https://portal.example.com/api/install.sh | bash
+portal expose 3000 --relays https://portal.example.com --discovery=false
 ```
 
 The installer downloads the `portal` binary and adds it to your `PATH`. It does
