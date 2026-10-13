@@ -149,13 +149,20 @@ func TestMuxRejectsActiveBodiesBeforeReadingMoreData(t *testing.T) {
 	if _, err := fmt.Fprint(extra, "POST /api/reputation/vote HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	response, err := http.ReadResponse(bufio.NewReader(extra), &http.Request{Method: http.MethodPost})
+	reader := bufio.NewReader(extra)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodPost})
 	if err != nil {
 		t.Fatalf("saturated gate waited for the unread body: %v", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("saturated gate status = %d, want %d", response.StatusCode, http.StatusTooManyRequests)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatalf("read rejection response: %v", err)
+	}
+	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("rejected HTTP/1 connection must close promptly, got %v", err)
 	}
 	select {
 	case <-started:
