@@ -23,14 +23,14 @@ import (
 )
 
 const (
-	defaultLeaseTTL                          = 2 * time.Minute
-	defaultRegisterChallengeTTL              = 2 * time.Minute
-	defaultRegisterChallengeOutstandingPerIP = 32
+	defaultLeaseTTL                           = 2 * time.Minute
+	defaultRegisterChallengeTTL               = 2 * time.Minute
+	defaultRegisterChallengeOutstandingPerIP  = 32
 	defaultRegisterChallengeOutstandingGlobal = 128
 	defaultRegisterChallengePendingBytes      = 256 << 10
-	defaultPortReservationGrace              = 5 * time.Minute
-	defaultIdleKeepalive                     = 15 * time.Second
-	defaultReadyQueueLimit                   = 8
+	defaultPortReservationGrace               = 5 * time.Minute
+	defaultIdleKeepalive                      = 15 * time.Second
+	defaultReadyQueueLimit                    = 8
 )
 
 type leaseRegistry struct {

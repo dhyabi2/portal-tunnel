@@ -34,12 +34,12 @@ import (
 )
 
 const (
-	defaultClaimTimeout          = 10 * time.Second
-	defaultClientHelloWait       = 2 * time.Second
-	defaultControlBodyLimit      = 4 << 20
+	defaultClaimTimeout               = 10 * time.Second
+	defaultClientHelloWait            = 2 * time.Second
+	defaultControlBodyLimit           = 4 << 20
 	defaultRegisterChallengeBodyLimit = 16 << 10
-	reverseOfferAdmissionWorkers = 16
-	quicBackhaulPendingLimit     = 64
+	reverseOfferAdmissionWorkers      = 16
+	quicBackhaulPendingLimit          = 64
 )
 
 type ServerConfig struct {
