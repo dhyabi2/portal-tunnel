@@ -571,3 +571,177 @@ func TestDetachOwnerSuppressesCacheRouting(t *testing.T) {
 		t.Fatal("detached identity was still served from cache")
 	}
 }
+
+func TestUploadAdmissionFairlyServesWaitingOwners(t *testing.T) {
+	c := testManager(t, 64)
+	type heldUpload struct {
+		started chan struct{}
+		resume  chan struct{}
+		result  <-chan int
+	}
+	start := func(lease Lease) heldUpload {
+		started := make(chan struct{})
+		resume := make(chan struct{})
+		result := make(chan int, 1)
+		req := testRequest(t, http.MethodPut, "site")
+		req.Body = &gatedBody{ReadCloser: req.Body, started: started, resume: resume}
+		go func() {
+			w := httptest.NewRecorder()
+			c.Handle(w, req, lease.ID, c.Generation(lease.ID))
+			result <- w.Code
+		}()
+		return heldUpload{started: started, resume: resume, result: result}
+	}
+	release := func(ch chan struct{}) {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+	await := func(ch <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(3 * time.Second):
+			t.Fatal("upload was not admitted")
+		}
+	}
+	waitQueue := func(count int) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			c.mu.Lock()
+			queued := len(c.uploadQueue)
+			c.mu.Unlock()
+			if queued == count {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("waiting upload count never reached %d", count)
+	}
+
+	firstLease := testLease(c, "first")
+	first := start(firstLease)
+	defer release(first.resume)
+	await(first.started)
+	second := start(testLease(c, "second"))
+	defer release(second.resume)
+	await(second.started)
+	third := start(testLease(c, "third"))
+	defer release(third.resume)
+	waitQueue(1)
+	fourth := start(testLease(c, "fourth"))
+	defer release(fourth.resume)
+	waitQueue(2)
+
+	// A second request from one owner cannot consume the remaining slot
+	// or jump ahead of the waiting owners.
+	rejected := httptest.NewRecorder()
+	c.Handle(rejected, testRequest(t, http.MethodPut, "site"), firstLease.ID, c.Generation(firstLease.ID))
+	if rejected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("duplicate owner admitted: %d", rejected.Code)
+	}
+
+	release(second.resume)
+	await(third.started)
+	select {
+	case <-fourth.started:
+		t.Fatal("later owner bypassed the FIFO queue")
+	default:
+	}
+	release(third.resume)
+	await(fourth.started)
+	release(first.resume)
+	release(fourth.resume)
+	for _, upload := range []heldUpload{first, second, third, fourth} {
+		select {
+		case code := <-upload.result:
+			if code != http.StatusOK {
+				t.Fatalf("admitted upload failed: %d", code)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("admitted upload did not complete")
+		}
+	}
+}
+
+func TestStalledMultipartUploadReleasesAdmission(t *testing.T) {
+	c := testManager(t, 64)
+	c.uploadIdleTimeout = 150 * time.Millisecond
+	stalled := testLease(c, "stalled")
+	other := testLease(c, "other")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.Handle(w, r, stalled.ID, c.Generation(stalled.ID))
+	}))
+	defer server.Close()
+	original := testRequest(t, http.MethodPut, "site")
+	body, err := io.ReadAll(original.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "PUT / HTTP/1.1\r\nHost: localhost\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n", original.Header.Get("Content-Type"), len(body)); err != nil {
+		t.Fatal(err)
+	}
+	// Send a partial multipart boundary, then keep the connection open.
+	if _, err := conn.Write(body[:8]); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPut})
+	if err != nil {
+		t.Fatalf("idle request never received an HTTP response: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusOK {
+		t.Fatal("stalled multipart upload unexpectedly succeeded")
+	}
+	w := httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPut, "site"), other.ID, c.Generation(other.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("stalled request retained admission: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestChangedManifestRetainsPublishedSnapshotUntilReplacement(t *testing.T) {
+	c := testManager(t, 64)
+	lease := testLease(c, "site")
+	upload := func(content string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		c.Handle(w, testRequest(t, http.MethodPut, content), lease.ID, c.Generation(lease.ID))
+		if w.Code != http.StatusOK {
+			t.Fatalf("upload failed: %d %s", w.Code, w.Body.String())
+		}
+	}
+	serve := func(content string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		if !c.Serve(w, httptest.NewRequest(http.MethodGet, "https://"+lease.Hostname+"/", nil), lease.Hostname) || w.Body.String() != content {
+			t.Fatalf("published content = %q, want %q", w.Body.String(), content)
+		}
+	}
+	upload("old")
+	w := httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPost, "new"), lease.ID, c.Generation(lease.ID))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	var status struct {
+		Data types.StaticCacheStatus `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil || status.Data.Present {
+		t.Fatalf("changed manifest reported present: %v, %s", err, w.Body.String())
+	}
+	serve("old")
+	upload("new")
+	serve("new")
+}
