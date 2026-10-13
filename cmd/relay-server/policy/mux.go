@@ -81,6 +81,8 @@ func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *S
 		}
 	}
 
+	// Active body capacity is independent of the refillable request-rate budget.
+	controlBodies := newControlBodyLimiter(controlBodyReadTimeout)
 	mux := http.NewServeMux()
 	mux.HandleFunc(types.PathHealthz, func(w http.ResponseWriter, _ *http.Request) {
 		utils.WriteAPIData(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -141,6 +143,10 @@ func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *S
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if utils.HandleAPICORS(w, r) {
+			return
+		}
+		if isControlJSONRequest(r) {
+			controlBodies.serve(w, r, ingress.SourceAddr(r), mux)
 			return
 		}
 		mux.ServeHTTP(w, r)
