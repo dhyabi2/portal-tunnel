@@ -205,7 +205,7 @@ func (c *Manager) Handle(w http.ResponseWriter, req *http.Request, leaseID strin
 	utils.WriteAPIData(w, http.StatusOK, status)
 }
 
-	
+
 // idleUploadBody applies an inactivity deadline to each blocking read.
 // The two-minute absolute deadline still caps uploads that trickle bytes.
 type idleUploadBody struct {
