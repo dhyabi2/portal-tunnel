@@ -118,23 +118,23 @@ func TestValidateReverseEndpointTransport(t *testing.T) {
 		endpoint types.ReverseEndpoint
 		wantErr  bool
 	}{
-		"direct":                {endpoint: direct},
-		"overlay disabled":      {endpoint: overlay, wantErr: true},
-		"overlay enabled":       {enabled: true, endpoint: overlay},
-		"fallback direct":       {enabled: true, endpoint: direct},
-		"legacy alternate":      {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL}, wantErr: true},
-		"legacy overlay":        {endpoint: types.ReverseEndpoint{URL: overlay.URL}, wantErr: true},
-		"unsigned gateway":      {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true, Gateway: &types.RelayDescriptor{APIHTTPSAddr: "https://gateway.example"}}, wantErr: true},
-		"missing gateway":       {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true}, wantErr: true},
-		"mismatched gateway":    {enabled: true, endpoint: types.ReverseEndpoint{URL: "https://other.example/sdk/connect", Overlay: true, Gateway: gateway}, wantErr: true},
+		"direct":               {endpoint: direct},
+		"overlay disabled":     {endpoint: overlay, wantErr: true},
+		"overlay enabled":      {enabled: true, endpoint: overlay},
+		"fallback direct":      {enabled: true, endpoint: direct},
+		"legacy alternate":     {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL}, wantErr: true},
+		"legacy overlay":       {endpoint: types.ReverseEndpoint{URL: overlay.URL}, wantErr: true},
+		"unsigned gateway":     {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true, Gateway: &types.RelayDescriptor{APIHTTPSAddr: "https://gateway.example"}}, wantErr: true},
+		"missing gateway":      {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true}, wantErr: true},
+		"mismatched gateway":   {enabled: true, endpoint: types.ReverseEndpoint{URL: "https://other.example/sdk/connect", Overlay: true, Gateway: gateway}, wantErr: true},
 		"unexpected direct":    {enabled: true, endpoint: types.ReverseEndpoint{URL: direct.URL, Overlay: true, Gateway: gateway}, wantErr: true},
 		"private ipv4":         {enabled: true, endpoint: privateEndpoint("https://192.168.1.1"), wantErr: true},
 		"loopback ipv4":        {enabled: true, endpoint: privateEndpoint("https://127.0.0.1"), wantErr: true},
 		"loopback ipv6":        {enabled: true, endpoint: privateEndpoint("https://[::1]"), wantErr: true},
 		"localhost hostname":   {enabled: true, endpoint: privateEndpoint("https://foo.localhost"), wantErr: true},
 		"shared address space": {enabled: true, endpoint: privateEndpoint("https://100.64.0.1"), wantErr: true},
-		"expired descriptor":    {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true, ExpiresAt: leaseExpiry, Gateway: signGateway("https://gateway.example", now.Add(-time.Second))}, wantErr: true},
-		"gateway expiry bound":  {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true, ExpiresAt: leaseExpiry, Gateway: signGateway("https://gateway.example", now.Add(30*time.Second))}, wantErr: true},
+		"expired descriptor":   {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true, ExpiresAt: leaseExpiry, Gateway: signGateway("https://gateway.example", now.Add(-time.Second))}, wantErr: true},
+		"gateway expiry bound": {enabled: true, endpoint: types.ReverseEndpoint{URL: overlay.URL, Overlay: true, ExpiresAt: leaseExpiry, Gateway: signGateway("https://gateway.example", now.Add(30*time.Second))}, wantErr: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
