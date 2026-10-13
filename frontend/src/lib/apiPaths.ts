@@ -25,10 +25,6 @@ export const RELAY_API_PATHS = {
     certificateChain: "/sdk/certificate-chain",
   },
   discovery: "/discovery",
-  install: {
-    shell: "/api/install.sh",
-    powershell: "/api/install.ps1",
-  },
 } as const;
 
 export const ROUTE_PATHS = {
