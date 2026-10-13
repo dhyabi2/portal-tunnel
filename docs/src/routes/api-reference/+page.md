@@ -146,6 +146,7 @@ Casper facilitator.
 | `POST` | `/api/policy` | Admin bearer | `PolicySettings` | `PolicySettings` |
 | `GET` | `/api/policy/state` | Admin bearer | none | `PolicyStateResponse` |
 | `POST` | `/api/policy/leases` | Admin bearer | `LeasePolicyUpdate` | `{}` |
+| `POST` | `/api/policy/leases/evict` | Admin bearer | `LeaseEvictRequest` | `{}` |
 
 ### Relay
 
@@ -227,6 +228,12 @@ Timestamps are JSON-encoded Go `time.Time` values.
 | `landing_page_enabled` | `boolean` |
 | `udp` | `PolicyPortSettings` |
 | `tcp_port` | `PolicyPortSettings` |
+
+`LeaseEvictRequest`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `identity_key` | `string` | active lease to terminate immediately; policy is unchanged |
 
 `LeasePolicyUpdate`:
 
