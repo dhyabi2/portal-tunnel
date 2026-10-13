@@ -16,6 +16,23 @@ import (
 	"github.com/gosuda/portal-tunnel/v2/types"
 )
 
+func TestHandleRegisterChallengeRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	body := `{"identity":{},"metadata":{"description":"` +
+		strings.Repeat("x", defaultRegisterChallengeBodyLimit) + `"}}`
+	req := httptest.NewRequest(http.MethodPost, "http://example.com"+types.PathSDKRegisterChallenge, strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	_, _, ok := (&Server{registry: registry}).HandleRegisterChallenge(recorder, req, netip.Addr{})
+	if ok || recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized challenge: ok = %v, status = %d, want 413", ok, recorder.Code)
+	}
+	if got := len(registry.records); got != 0 {
+		t.Fatalf("oversized challenge retained %d records, want none", got)
+	}
+}
+
 func TestNewServerRejectsPortalURLCredentialsWithoutEchoingThem(t *testing.T) {
 	_, err := NewServer(ServerConfig{
 		PortalURL: "https://user:secret@localhost",

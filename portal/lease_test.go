@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -532,6 +533,127 @@ func TestIssueRegisterChallengeBoundsPendingPerIP(t *testing.T) {
 	}, "example.com", "https://example.com"+types.PathSDKRegister, sourceAddr)
 	if err != nil {
 		t.Fatalf("issueRegisterChallenge() after expired cleanup error = %v", err)
+	}
+}
+
+func TestRegistrationAndRenewalRejectOversizedMetadata(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	leaseIdentity := newTestLeaseIdentity(t, "metadata-bound")
+	oversized := types.LeaseMetadata{
+		Description: strings.Repeat("x", types.LeaseMetadataMaxDescriptionBytes+1),
+	}
+	_, err := registry.issueRegisterChallenge(types.RegisterChallengeRequest{
+		Identity: leaseIdentity,
+		Metadata: oversized,
+	}, "example.com", "https://example.com"+types.PathSDKRegister, netip.MustParseAddr("203.0.113.10"))
+	if err == nil || len(registry.records) != 0 {
+		t.Fatalf("oversized challenge metadata: error = %v, records = %d", err, len(registry.records))
+	}
+	if _, _, err := registry.Register(types.RegisterChallengeRequest{
+		Identity: leaseIdentity,
+		Metadata: oversized,
+	}, netip.Addr{}, "", types.RelayDescriptor{}, nil); err == nil || len(registry.records) != 0 {
+		t.Fatalf("oversized direct registration: error = %v, records = %d", err, len(registry.records))
+	}
+
+	record, response, err := registry.Register(types.RegisterChallengeRequest{
+		Identity: leaseIdentity,
+		Metadata: types.LeaseMetadata{Description: "original"},
+	}, netip.Addr{}, "", types.RelayDescriptor{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := record.ExpiresAt
+	if _, _, err := registry.Renew(types.RenewRequest{
+		AccessToken: response.AccessToken,
+		TTL:         3600,
+		Metadata:    oversized,
+	}, netip.Addr{}); err == nil {
+		t.Fatal("Renew() accepted oversized metadata")
+	}
+	if !record.ExpiresAt.Equal(expiresAt) || record.Metadata.Description != "original" {
+		t.Fatal("rejected renewal modified the existing lease")
+	}
+}
+
+func TestIssueRegisterChallengeBoundsPendingGlobally(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	leaseIdentity := newTestLeaseIdentity(t, "global-bound")
+	req := types.RegisterChallengeRequest{Identity: leaseIdentity}
+	uri := "https://example.com" + types.PathSDKRegister
+	for i := range defaultRegisterChallengeOutstandingGlobal {
+		addr := netip.AddrFrom4([4]byte{192, 0, 2, byte(i + 1)})
+		if _, err := registry.issueRegisterChallenge(req, "example.com", uri, addr); err != nil {
+			t.Fatalf("issueRegisterChallenge(%d) error = %v", i, err)
+		}
+	}
+	totalBytes := 0
+	for _, record := range registry.records {
+		totalBytes += pendingRegisterChallengeBytes(record.registerChallenge)
+	}
+	if totalBytes >= defaultRegisterChallengePendingBytes {
+		t.Fatalf("count budget test already filled byte budget: %d", totalBytes)
+	}
+	other := netip.AddrFrom4([4]byte{192, 0, 2, 200})
+	if _, err := registry.issueRegisterChallenge(req, "example.com", uri, other); !errors.Is(err, errRegisterChallengePending) {
+		t.Fatalf("global count limit error = %v, want pending limit", err)
+	}
+	if got := len(registry.records); got != defaultRegisterChallengeOutstandingGlobal {
+		t.Fatalf("pending records = %d, want %d", got, defaultRegisterChallengeOutstandingGlobal)
+	}
+
+	registry.records[0].ExpiresAt = time.Now().Add(-time.Second)
+	if _, err := registry.issueRegisterChallenge(req, "example.com", uri, other); err != nil {
+		t.Fatalf("expired challenge did not release global capacity: %v", err)
+	}
+}
+
+func TestIssueRegisterChallengeBoundsPendingBytes(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	leaseIdentity := newTestLeaseIdentity(t, "bytes-bound")
+	req := types.RegisterChallengeRequest{
+		Identity: leaseIdentity,
+		Metadata: types.LeaseMetadata{
+			Description: strings.Repeat("d", types.LeaseMetadataMaxDescriptionBytes),
+			Thumbnail:   strings.Repeat("t", 1700),
+		},
+	}
+	if err := req.Metadata.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	uri := "https://example.com" + types.PathSDKRegister
+	admitted := 0
+	for i := range defaultRegisterChallengeOutstandingGlobal {
+		addr := netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)})
+		_, err := registry.issueRegisterChallenge(req, "example.com", uri, addr)
+		if errors.Is(err, errRegisterChallengePending) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("issueRegisterChallenge(%d) error = %v", i, err)
+		}
+		admitted++
+	}
+	if admitted == 0 || admitted >= defaultRegisterChallengeOutstandingGlobal {
+		t.Fatalf("byte ceiling admitted %d challenges, want between 1 and %d", admitted, defaultRegisterChallengeOutstandingGlobal-1)
+	}
+	totalBytes := 0
+	for _, record := range registry.records {
+		totalBytes += pendingRegisterChallengeBytes(record.registerChallenge)
+	}
+	if totalBytes > defaultRegisterChallengePendingBytes {
+		t.Fatalf("pending bytes = %d, exceeds %d", totalBytes, defaultRegisterChallengePendingBytes)
+	}
+	registry.records[0].ExpiresAt = time.Now().Add(-time.Second)
+	other := netip.AddrFrom4([4]byte{198, 51, 100, 200})
+	if _, err := registry.issueRegisterChallenge(req, "example.com", uri, other); err != nil {
+		t.Fatalf("expired challenge did not release byte capacity: %v", err)
 	}
 }
 

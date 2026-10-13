@@ -26,6 +26,8 @@ const (
 	defaultLeaseTTL                          = 2 * time.Minute
 	defaultRegisterChallengeTTL              = 2 * time.Minute
 	defaultRegisterChallengeOutstandingPerIP = 32
+	defaultRegisterChallengeOutstandingGlobal = 128
+	defaultRegisterChallengePendingBytes      = 256 << 10
 	defaultPortReservationGrace              = 5 * time.Minute
 	defaultIdleKeepalive                     = 15 * time.Second
 	defaultReadyQueueLimit                   = 8
@@ -267,6 +269,9 @@ func (r *leaseRegistry) Register(req types.RegisterChallengeRequest, sourceAddr 
 		return nil, types.RegisterResponse{}, errFeatureUnavailable
 	}
 	leaseIdentity := req.Identity
+	if err := req.Metadata.Validate(); err != nil {
+		return nil, types.RegisterResponse{}, err
+	}
 
 	ttl := defaultLeaseTTL
 	if req.TTL > 0 {
@@ -523,6 +528,9 @@ func (r *leaseRegistry) Renew(req types.RenewRequest, sourceAddr netip.Addr) (ty
 	if err != nil {
 		return types.RenewResponse{}, reverseEndpointInput{}, errUnauthorized
 	}
+	if err := req.Metadata.Validate(); err != nil {
+		return types.RenewResponse{}, reverseEndpointInput{}, err
+	}
 	ttl := defaultLeaseTTL
 	if req.TTL > 0 {
 		ttl = time.Duration(req.TTL) * time.Second
@@ -671,6 +679,15 @@ func (r *leaseRegistry) Unregister(req types.UnregisterRequest) (*leaseRecord, e
 	return nil, errLeaseNotFound
 }
 
+// pendingRegisterChallengeBytes estimates variable data and fixed record overhead.
+// The registry also imposes an entry ceiling, bounding uncounted allocations.
+func pendingRegisterChallengeBytes(challenge *identity.RegisterChallenge) int {
+	const recordOverhead = 512
+	return recordOverhead + len(challenge.ChallengeID) + len(challenge.SIWEMessage) +
+		len(challenge.Request.Identity.Name) + len(challenge.Request.Identity.Address) +
+		challenge.Request.Metadata.RetainedBytes()
+}
+
 func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeRequest, domain, uri string, sourceAddr netip.Addr) (types.RegisterChallengeResponse, error) {
 	if r == nil {
 		return types.RegisterChallengeResponse{}, errFeatureUnavailable
@@ -687,7 +704,7 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	pending := 0
+	pendingForSource, pendingTotal, pendingBytes := 0, 0, 0
 	for i := 0; i < len(r.records); {
 		record := r.records[i]
 		if record != nil && record.registerChallenge != nil {
@@ -695,13 +712,17 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 				r.deleteRecord(i)
 				continue
 			}
+			pendingTotal++
+			pendingBytes += pendingRegisterChallengeBytes(record.registerChallenge)
 			if record.sourceAddr == sourceAddr {
-				pending++
+				pendingForSource++
 			}
 		}
 		i++
 	}
-	if pending >= defaultRegisterChallengeOutstandingPerIP {
+	if pendingForSource >= defaultRegisterChallengeOutstandingPerIP ||
+		pendingTotal >= defaultRegisterChallengeOutstandingGlobal ||
+		pendingBytes+pendingRegisterChallengeBytes(challenge) > defaultRegisterChallengePendingBytes {
 		return types.RegisterChallengeResponse{}, errRegisterChallengePending
 	}
 	r.records = append(r.records, &leaseRecord{

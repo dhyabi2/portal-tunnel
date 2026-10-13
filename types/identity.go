@@ -120,6 +120,51 @@ type LeaseMetadata struct {
 	Hide        bool     `json:"hide,omitempty"`
 }
 
+// Metadata limits apply to both pending registration challenges and live leases.
+// All lengths are bytes, not Unicode character counts.
+const (
+	LeaseMetadataMaxDescriptionBytes = 2048
+	LeaseMetadataMaxOwnerBytes       = 256
+	LeaseMetadataMaxThumbnailBytes   = 2048
+	LeaseMetadataMaxTags             = 16
+	LeaseMetadataMaxTagBytes         = 64
+	LeaseMetadataMaxBytes            = 4096
+)
+
+// RetainedBytes counts metadata string data and the tag slice's string headers.
+// It is a conservative admission estimate, not a heap profiler measurement.
+func (m LeaseMetadata) RetainedBytes() int {
+	size := len(m.Description) + len(m.Owner) + len(m.Thumbnail) + len(m.Tags)*16
+	for _, tag := range m.Tags {
+		size += len(tag)
+	}
+	return size
+}
+
+func (m LeaseMetadata) Validate() error {
+	if len(m.Description) > LeaseMetadataMaxDescriptionBytes {
+		return fmt.Errorf("metadata.description exceeds %d bytes", LeaseMetadataMaxDescriptionBytes)
+	}
+	if len(m.Owner) > LeaseMetadataMaxOwnerBytes {
+		return fmt.Errorf("metadata.owner exceeds %d bytes", LeaseMetadataMaxOwnerBytes)
+	}
+	if len(m.Thumbnail) > LeaseMetadataMaxThumbnailBytes {
+		return fmt.Errorf("metadata.thumbnail exceeds %d bytes", LeaseMetadataMaxThumbnailBytes)
+	}
+	if len(m.Tags) > LeaseMetadataMaxTags {
+		return fmt.Errorf("metadata.tags exceeds %d entries", LeaseMetadataMaxTags)
+	}
+	for i, tag := range m.Tags {
+		if len(tag) > LeaseMetadataMaxTagBytes {
+			return fmt.Errorf("metadata.tags[%d] exceeds %d bytes", i, LeaseMetadataMaxTagBytes)
+		}
+	}
+	if m.RetainedBytes() > LeaseMetadataMaxBytes {
+		return fmt.Errorf("metadata exceeds %d retained bytes", LeaseMetadataMaxBytes)
+	}
+	return nil
+}
+
 func (m LeaseMetadata) Copy() LeaseMetadata {
 	return LeaseMetadata{
 		Description: m.Description,

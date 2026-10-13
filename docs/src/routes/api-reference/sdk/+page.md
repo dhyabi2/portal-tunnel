@@ -84,6 +84,14 @@ which are configured locally by the tunnel process.
 
 Cache opt-in is incompatible with raw TCP/UDP leases.
 
+The unauthenticated challenge request body is limited to 16 KiB. Metadata limits
+also apply when a lease is registered or renewed: description up to 2,048 bytes,
+owner up to 256 bytes, thumbnail up to 2,048 bytes, at most 16 tags of 64 bytes
+each, and a combined retained-data budget of 4,096 bytes (including tag string
+headers). Oversized metadata is rejected with HTTP 400. When the relay's global
+pending-challenge count or byte budget is full, new challenges receive HTTP 429.
+All sizes are measured in bytes, not characters.
+
 `RegisterChallengeResponse`:
 
 | Field | Type |

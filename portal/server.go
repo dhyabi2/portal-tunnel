@@ -37,6 +37,7 @@ const (
 	defaultClaimTimeout          = 10 * time.Second
 	defaultClientHelloWait       = 2 * time.Second
 	defaultControlBodyLimit      = 4 << 20
+	defaultRegisterChallengeBodyLimit = 16 << 10
 	reverseOfferAdmissionWorkers = 16
 	quicBackhaulPendingLimit     = 64
 )
