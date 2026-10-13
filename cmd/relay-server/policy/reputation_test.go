@@ -111,3 +111,21 @@ func TestReputationRepeatVoteWithoutCookie(t *testing.T) {
 		}
 	}
 }
+
+
+func TestReputationCookielessIdentitySurvivesRestart(t *testing.T) {
+	store := newTestReputationStore(t)
+	source := netip.MustParseAddr("203.0.113.10")
+	_, cookie, err := store.CastVote("demo.example.com", "id:demo.example.com", VoteUp, "", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewReputationStore(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, again, err := restarted.CastVote("demo.example.com", "id:demo.example.com", VoteDown, "", source)
+	if err != nil || summary.Total != 1 || summary.Down != 1 || again != cookie {
+		t.Fatalf("CastVote(after restart) = %+v, cookie=%q, err=%v, want one updated vote and cookie %q", summary, again, err, cookie)
+	}
+}
