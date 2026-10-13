@@ -1098,13 +1098,22 @@ func (a *portPool) release(port int, record *leaseRecord) {
 	a.cleanupExpired(time.Now())
 }
 
-// releaseImmediately skips the grace period when the removed lease still
-// owns the port. Its socket must be closed first.
+// releaseImmediately also removes a grace reservation if another cleanup
+// already closed this lease. Never reclaim a port owned by a different lease.
 func (a *portPool) releaseImmediately(port int, record *leaseRecord) {
-	if a.inUse[port] != record {
-		return
+	if owner, ok := a.inUse[port]; ok {
+		if owner != record {
+			return
+		}
+		delete(a.inUse, port)
+	} else {
+		key := record.ServiceKey()
+		reservation, ok := a.reserved[key]
+		if !ok || reservation.port != port {
+			return
+		}
+		delete(a.reserved, key)
 	}
-	delete(a.inUse, port)
 	a.sortedInsert(port)
 }
 
