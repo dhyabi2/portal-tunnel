@@ -114,7 +114,7 @@ Relay server exposes:
 
 - `/` - embedded React SPA
 - `/api/state` - public leases
-- `/api/install.sh` and `/api/install.ps1` - CLI installers
+- `/api/install.sh` and `/api/install.ps1` - retired; return HTTP 410 Gone. Install from official GitHub releases.
 - `/api/admin/auth/*` - admin token auth endpoints
 - `/api/policy/*` - relay policy endpoints
 - `/sdk/*` - SDK/control endpoints
