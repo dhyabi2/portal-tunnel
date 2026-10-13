@@ -53,21 +53,40 @@ func TestControlBodyGateBoundsActiveSourcesAndGlobalWork(t *testing.T) {
 	}
 }
 
-func TestControlBodyGuardKeepsUpgradesAndCacheUnbounded(t *testing.T) {
-	for _, path := range []string{types.PathSDKConnect, types.PathSDKCache} {
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
+func TestControlBodyGuardKeepsStreamingCacheUploadsSeparate(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		req := httptest.NewRequest(method, types.PathSDKCache, strings.NewReader("{"))
 		if isControlBodyRequest(req) {
-			t.Fatalf("%s must not inherit JSON body deadlines", path)
+			t.Fatalf("%s cache upload must use the cache-owned deadline", method)
 		}
 	}
-	for _, path := range []string{types.PathSDKRegister, types.PathSDKRenew, types.PathDiscoveryAnnounce, types.PathPolicy, types.PathV1Sign} {
+	for _, path := range []string{types.PathSDKRegister, types.PathSDKRenew, types.PathDiscoveryAnnounce, types.PathPolicy, types.PathV1Sign, types.PathSDKConnect, "/"} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
 		if !isControlBodyRequest(req) {
-			t.Fatalf("%s must bound JSON request bodies", path)
+			t.Fatalf("%s must bound a nonempty request body", path)
 		}
 	}
 	if isControlBodyRequest(httptest.NewRequest(http.MethodGet, types.PathSDKConnect, nil)) {
 		t.Fatal("reverse tunnel upgrade must not receive a body deadline")
+	}
+}
+
+func TestMuxRejectsReverseUpgradeWithUnexpectedBody(t *testing.T) {
+	handler := Mux(nil, http.NotFoundHandler(), nil, nil, nil, types.PreAuthConfig{})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+types.PathSDKConnect, strings.NewReader("{"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || !response.Close {
+		t.Fatalf("body-bearing reverse upgrade response = %d, close = %t", response.StatusCode, response.Close)
 	}
 }
 
