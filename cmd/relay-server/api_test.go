@@ -190,3 +190,34 @@ func TestAdminMutationRejectsMalformedIdentityKey(t *testing.T) {
 		t.Fatalf("malformed identity key mutation: %d, want 400", response.Code)
 	}
 }
+
+func TestLeaseEvictionAdminAuthorizationAndValidation(t *testing.T) {
+	api, _, err := newPolicyAPI(t, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		method string
+		body   string
+		admin  bool
+		want   int
+	}{
+		{name: "unauthorized", method: http.MethodPost, body: `{"identity_key":"demo:addr"}`, want: http.StatusUnauthorized},
+		{name: "invalid identity", method: http.MethodPost, body: `{"identity_key":"invalid"}`, admin: true, want: http.StatusBadRequest},
+		{name: "not found", method: http.MethodPost, body: `{"identity_key":"demo:addr"}`, admin: true, want: http.StatusNotFound},
+		{name: "method rejected", method: http.MethodGet, body: `{"identity_key":"demo:addr"}`, admin: true, want: http.StatusMethodNotAllowed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(tc.method, types.PathPolicyLeaseEvict, strings.NewReader(tc.body))
+			if tc.admin {
+				request.Header.Set("Authorization", "Bearer admin-test")
+			}
+			response := httptest.NewRecorder()
+			api.Handler().ServeHTTP(response, request)
+			if response.Code != tc.want {
+				t.Fatalf("eviction status = %d, want %d; body=%s", response.Code, tc.want, response.Body.String())
+			}
+		})
+	}
+}
