@@ -24,12 +24,28 @@ import (
 
 const (
 	defaultLeaseTTL                          = 2 * time.Minute
+	maxLeaseTTL                              = 10 * time.Minute
+	maxLiveLeases                            = 4096
+	maxLiveLeasesPerSource                   = 128
+	maxPendingRegisterChallenges            = 2048
 	defaultRegisterChallengeTTL              = 2 * time.Minute
 	defaultRegisterChallengeOutstandingPerIP = 32
 	defaultPortReservationGrace              = 5 * time.Minute
 	defaultIdleKeepalive                     = 15 * time.Second
 	defaultReadyQueueLimit                   = 8
 )
+
+// requestedLeaseTTL rejects oversized values before converting seconds to
+// time.Duration. Non-positive values retain the existing default behavior.
+func requestedLeaseTTL(seconds int) (time.Duration, error) {
+	if seconds <= 0 {
+		return defaultLeaseTTL, nil
+	}
+	if seconds > int(maxLeaseTTL/time.Second) {
+		return 0, errLeaseTTLExceeded
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
 
 type leaseRegistry struct {
 	records        []*leaseRecord
@@ -262,15 +278,32 @@ func (r *leaseRegistry) recordForVerifiedLease(key types.ServiceIdentityKey, lea
 	return record, nil
 }
 
+// atLeaseCapacityLocked counts only live leases owned by other identities.
+// Reconnects replace an existing lease without consuming another slot.
+// The caller must hold r.mu.
+func (r *leaseRegistry) atLeaseCapacityLocked(key types.ServiceIdentityKey, source netip.Addr, now time.Time) bool {
+	live, fromSource := 0, 0
+	for _, record := range r.records {
+		if record == nil || record.reverse == nil || record.isExpired(now) || record.ServiceKey() == key {
+			continue
+		}
+		live++
+		if source.IsValid() && record.sourceAddr == source {
+			fromSource++
+		}
+	}
+	return live >= maxLiveLeases || (source.IsValid() && fromSource >= maxLiveLeasesPerSource)
+}
+
 func (r *leaseRegistry) Register(req types.RegisterChallengeRequest, sourceAddr netip.Addr, reportedIP string, self types.RelayDescriptor, descriptors []types.RelayDescriptor) (*leaseRecord, types.RegisterResponse, error) {
 	if r == nil {
 		return nil, types.RegisterResponse{}, errFeatureUnavailable
 	}
 	leaseIdentity := req.Identity
 
-	ttl := defaultLeaseTTL
-	if req.TTL > 0 {
-		ttl = time.Duration(req.TTL) * time.Second
+	ttl, err := requestedLeaseTTL(req.TTL)
+	if err != nil {
+		return nil, types.RegisterResponse{}, err
 	}
 
 	identityKey := leaseIdentity.ServiceKey()
@@ -319,6 +352,11 @@ func (r *leaseRegistry) Register(req types.RegisterChallengeRequest, sourceAddr 
 	}
 
 	r.mu.Lock()
+	if r.atLeaseCapacityLocked(identityKey, sourceAddr, time.Now()) {
+		r.mu.Unlock()
+		r.closeRecord(record)
+		return nil, types.RegisterResponse{}, errLeaseCapacityExceeded
+	}
 	if req.UDPEnabled {
 		port, err := r.udpPorts.allocate(record)
 		if err != nil {
@@ -348,6 +386,11 @@ func (r *leaseRegistry) Register(req types.RegisterChallengeRequest, sourceAddr 
 	replacedIndex := -1
 	r.mu.Lock()
 	now := time.Now()
+	if r.atLeaseCapacityLocked(identityKey, sourceAddr, now) {
+		r.mu.Unlock()
+		r.closeRecord(record)
+		return nil, types.RegisterResponse{}, errLeaseCapacityExceeded
+	}
 	udpLeases := 0
 	tcpLeases := 0
 	for i, existing := range r.records {
@@ -523,9 +566,9 @@ func (r *leaseRegistry) Renew(req types.RenewRequest, sourceAddr netip.Addr) (ty
 	if err != nil {
 		return types.RenewResponse{}, reverseEndpointInput{}, errUnauthorized
 	}
-	ttl := defaultLeaseTTL
-	if req.TTL > 0 {
-		ttl = time.Duration(req.TTL) * time.Second
+	ttl, err := requestedLeaseTTL(req.TTL)
+	if err != nil {
+		return types.RenewResponse{}, reverseEndpointInput{}, err
 	}
 
 	leaseKey := claims.Identity.ServiceKey()
@@ -671,9 +714,42 @@ func (r *leaseRegistry) Unregister(req types.UnregisterRequest) (*leaseRecord, e
 	return nil, errLeaseNotFound
 }
 
+// EvictLease removes a lease by authenticated administrative identity rather
+// than by an access token. Close sockets before returning ports to the pool.
+func (r *leaseRegistry) EvictLease(key types.ServiceIdentityKey) *leaseRecord {
+	if r == nil || !key.Valid() {
+		return nil
+	}
+	r.mu.Lock()
+	for i, record := range r.records {
+		if record == nil || record.reverse == nil || record.ServiceKey() != key {
+			continue
+		}
+		r.deleteRecord(i)
+		r.bps.ResetIdentityLimiter(key)
+		r.mu.Unlock()
+
+		r.closeRecord(record)
+		r.mu.Lock()
+		if record.datagram != nil {
+			r.udpPorts.releaseImmediately(record.datagram.UDPPort(), record)
+		}
+		if record.tcpPort > 0 {
+			r.tcpPorts.releaseImmediately(record.tcpPort, record)
+		}
+		r.mu.Unlock()
+		return record
+	}
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeRequest, domain, uri string, sourceAddr netip.Addr) (types.RegisterChallengeResponse, error) {
 	if r == nil {
 		return types.RegisterChallengeResponse{}, errFeatureUnavailable
+	}
+	if _, err := requestedLeaseTTL(req.TTL); err != nil {
+		return types.RegisterChallengeResponse{}, err
 	}
 
 	now := time.Now().UTC()
@@ -687,7 +763,7 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	pending := 0
+	pending, pendingTotal := 0, 0
 	for i := 0; i < len(r.records); {
 		record := r.records[i]
 		if record != nil && record.registerChallenge != nil {
@@ -695,11 +771,15 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 				r.deleteRecord(i)
 				continue
 			}
+			pendingTotal++
 			if record.sourceAddr == sourceAddr {
 				pending++
 			}
 		}
 		i++
+	}
+	if pendingTotal >= maxPendingRegisterChallenges {
+		return types.RegisterChallengeResponse{}, errRegisterChallengeCapacity
 	}
 	if pending >= defaultRegisterChallengeOutstandingPerIP {
 		return types.RegisterChallengeResponse{}, errRegisterChallengePending
@@ -1007,6 +1087,25 @@ func (a *portPool) release(port int, record *leaseRecord) {
 		expiresAt: time.Now().Add(a.grace),
 	}
 	a.cleanupExpired(time.Now())
+}
+
+// releaseImmediately clears the port's grace reservation after its socket is
+// closed. It never reclaims a port already reassigned to another lease.
+func (a *portPool) releaseImmediately(port int, record *leaseRecord) {
+	if owner, ok := a.inUse[port]; ok {
+		if owner != record {
+			return
+		}
+		delete(a.inUse, port)
+	} else {
+		key := record.ServiceKey()
+		reservation, ok := a.reserved[key]
+		if !ok || reservation.port != port {
+			return
+		}
+		delete(a.reserved, key)
+	}
+	a.sortedInsert(port)
 }
 
 func (a *portPool) cleanupExpired(now time.Time) {
