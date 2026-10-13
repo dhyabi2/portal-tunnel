@@ -74,22 +74,19 @@ func (g *controlBodyGate) wrap(ingress *Ingress, next http.Handler) http.Handler
 			return
 		}
 
+		// Prevent net/http from draining an unread HTTP/1 request body after
+		// this handler releases its in-flight slot.
+		if r.ProtoMajor == 1 {
+			w.Header().Set("Connection", "close")
+		}
 		source := ingress.SourceAddr(r)
 		if !g.acquire(source) {
-			// Do not make net/http drain a rejected, potentially endless
-			// HTTP/1 request body before reusing the connection.
-			if r.ProtoMajor == 1 {
-				w.Header().Set("Connection", "close")
-			}
 			WriteRetryAfter(w, time.Second, "too many active control requests")
 			return
 		}
 		defer g.release(source)
 
 		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(controlBodyReadTimeout)); err != nil {
-			if r.ProtoMajor == 1 {
-				w.Header().Set("Connection", "close")
-			}
 			utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeInternal, "control request body deadline unavailable")
 			return
 		}
