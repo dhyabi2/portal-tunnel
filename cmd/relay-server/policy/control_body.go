@@ -3,7 +3,6 @@ package policy
 import (
 	"net/http"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
@@ -51,22 +50,25 @@ func (g *controlBodyGate) release(source netip.Addr) {
 	}
 }
 
-// A body deadline applies only to control-plane POSTs. Cache uploads can be
-// large, and /sdk/connect upgrades to a long-lived reverse transport.
+// Only authenticated cache uploads have a separate streaming body deadline.
+// Normal reverse connections carry no HTTP request body.
 func isControlBodyRequest(r *http.Request) bool {
-	if r.Method != http.MethodPost || r.Body == http.NoBody {
+	if r.Body == nil || r.Body == http.NoBody {
 		return false
 	}
-	path := r.URL.Path
-	return (strings.HasPrefix(path, types.PathAPIPrefix+"/") ||
-		strings.HasPrefix(path, types.PathSDKPrefix+"/") ||
-		path == types.PathDiscoveryAnnounce ||
-		path == types.PathV1Sign) &&
-		path != types.PathSDKConnect && path != types.PathSDKCache
+	return r.URL.Path != types.PathSDKCache ||
+		(r.Method != http.MethodPost && r.Method != http.MethodPut)
 }
 
 func (g *controlBodyGate) wrap(ingress *Ingress, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == types.PathSDKConnect && r.Method == http.MethodGet && r.Body != nil && r.Body != http.NoBody {
+			if r.ProtoMajor == 1 {
+				w.Header().Set("Connection", "close")
+			}
+			utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest, "reverse connect requests must not contain a body")
+			return
+		}
 		if !isControlBodyRequest(r) {
 			next.ServeHTTP(w, r)
 			return
