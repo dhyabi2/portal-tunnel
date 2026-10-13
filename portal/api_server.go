@@ -61,21 +61,21 @@ type apiError struct {
 func (e *apiError) Error() string { return e.msg }
 
 var (
-	errFeatureUnavailable       = &apiError{types.APIErrorCodeFeatureUnavailable, "feature unavailable", http.StatusServiceUnavailable}
-	errHostnameConflict         = &apiError{types.APIErrorCodeHostnameConflict, "hostname conflict", http.StatusConflict}
-	errLeaseNotFound            = &apiError{types.APIErrorCodeLeaseNotFound, "lease not found", http.StatusNotFound}
-	errLeaseTTLExceeded         = &apiError{types.APIErrorCodeInvalidRequest, "lease TTL exceeds 10 minutes", http.StatusBadRequest}
-	errLeaseCapacityExceeded   = &apiError{types.APIErrorCodeRateLimited, "relay lease capacity exceeded", http.StatusTooManyRequests}
-	errLeaseRejected            = &apiError{types.APIErrorCodeLeaseRejected, "lease is not approved for routing", http.StatusForbidden}
-	errTransportMismatch        = &apiError{types.APIErrorCodeTransportMismatch, "transport mismatch", http.StatusConflict}
-	errUnauthorized             = &apiError{types.APIErrorCodeUnauthorized, "unauthorized", http.StatusForbidden}
-	errUDPDisabled              = &apiError{types.APIErrorCodeUDPDisabled, "udp disabled", http.StatusForbidden}
-	errUDPCapacityExceeded      = &apiError{types.APIErrorCodeUDPCapacityExceeded, "udp capacity exceeded", http.StatusServiceUnavailable}
-	errUDPPortExhausted         = &apiError{types.APIErrorCodeUDPPortExhausted, "no udp ports available", http.StatusServiceUnavailable}
-	errTCPPortDisabled          = &apiError{types.APIErrorCodeTCPPortDisabled, "tcp port disabled", http.StatusForbidden}
-	errTCPPortCapacityExceeded  = &apiError{types.APIErrorCodeTCPPortCapacityExceeded, "tcp port capacity exceeded", http.StatusServiceUnavailable}
-	errTCPPortExhausted         = &apiError{types.APIErrorCodeTCPPortExhausted, "no tcp ports available", http.StatusServiceUnavailable}
-	errRegisterChallengePending = &apiError{types.APIErrorCodeRateLimited, "too many pending register challenges", http.StatusTooManyRequests}
+	errFeatureUnavailable        = &apiError{types.APIErrorCodeFeatureUnavailable, "feature unavailable", http.StatusServiceUnavailable}
+	errHostnameConflict          = &apiError{types.APIErrorCodeHostnameConflict, "hostname conflict", http.StatusConflict}
+	errLeaseNotFound             = &apiError{types.APIErrorCodeLeaseNotFound, "lease not found", http.StatusNotFound}
+	errLeaseTTLExceeded          = &apiError{types.APIErrorCodeInvalidRequest, "lease TTL exceeds 10 minutes", http.StatusBadRequest}
+	errLeaseCapacityExceeded     = &apiError{types.APIErrorCodeRateLimited, "relay lease capacity exceeded", http.StatusTooManyRequests}
+	errLeaseRejected             = &apiError{types.APIErrorCodeLeaseRejected, "lease is not approved for routing", http.StatusForbidden}
+	errTransportMismatch         = &apiError{types.APIErrorCodeTransportMismatch, "transport mismatch", http.StatusConflict}
+	errUnauthorized              = &apiError{types.APIErrorCodeUnauthorized, "unauthorized", http.StatusForbidden}
+	errUDPDisabled               = &apiError{types.APIErrorCodeUDPDisabled, "udp disabled", http.StatusForbidden}
+	errUDPCapacityExceeded       = &apiError{types.APIErrorCodeUDPCapacityExceeded, "udp capacity exceeded", http.StatusServiceUnavailable}
+	errUDPPortExhausted          = &apiError{types.APIErrorCodeUDPPortExhausted, "no udp ports available", http.StatusServiceUnavailable}
+	errTCPPortDisabled           = &apiError{types.APIErrorCodeTCPPortDisabled, "tcp port disabled", http.StatusForbidden}
+	errTCPPortCapacityExceeded   = &apiError{types.APIErrorCodeTCPPortCapacityExceeded, "tcp port capacity exceeded", http.StatusServiceUnavailable}
+	errTCPPortExhausted          = &apiError{types.APIErrorCodeTCPPortExhausted, "no tcp ports available", http.StatusServiceUnavailable}
+	errRegisterChallengePending  = &apiError{types.APIErrorCodeRateLimited, "too many pending register challenges", http.StatusTooManyRequests}
 	errRegisterChallengeCapacity = &apiError{types.APIErrorCodeRateLimited, "relay pending register challenge capacity exceeded", http.StatusTooManyRequests}
 )
 
