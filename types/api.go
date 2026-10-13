@@ -78,7 +78,7 @@ type RegisterChallengeRequest struct {
 	Identity               Identity      `json:"identity"`
 	Metadata               LeaseMetadata `json:"metadata"`
 	Overlay                bool          `json:"overlay,omitempty"`
-	TTL                    int           `json:"ttl,omitempty"`
+	TTL                    int           `json:"ttl,omitempty"` // Requested seconds; default 120, maximum 600.
 	UDPEnabled             bool          `json:"udp_enabled,omitempty"`
 	TCPEnabled             bool          `json:"tcp_enabled,omitempty"`
 }
@@ -146,7 +146,7 @@ type DiscoveryAnnounceResponse struct {
 
 type RenewRequest struct {
 	AccessToken string        `json:"access_token"`
-	TTL         int           `json:"ttl,omitempty"`
+	TTL         int           `json:"ttl,omitempty"` // Requested seconds; default 120, maximum 600.
 	ReportedIP  string        `json:"reported_ip,omitempty"`
 	Metadata    LeaseMetadata `json:"metadata"`
 }
