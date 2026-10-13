@@ -76,13 +76,18 @@ which are configured locally by the tunnel process.
 | `allow_canonical_fallback` | `boolean` | no | allow canonical-only registration when the friendly alias is unavailable; defaults to `false` for protocol-10 compatibility |
 | `metadata` | `LeaseMetadata` | no | public lease metadata |
 | `overlay` | `boolean` | no | prefer an [IVNP overlay path](/concepts#ivnp-backed-overlay-networking) when available; defaults to `false` |
-| `ttl` | `number` | no | requested TTL in seconds |
+| `ttl` | `number` | no | Requested seconds; non-positive values use 120, maximum 600 (10 minutes). Larger values return HTTP 400. |
 | `udp_enabled` | `boolean` | no | request UDP transport |
 | `tcp_enabled` | `boolean` | no | request dedicated TCP port |
 | `cache` | `boolean` | no | Explicitly permit static storage and relay TLS termination; default `false` |
 | `cache_ttl` | `number` | no | Requested offline seconds; `0` uses relay policy, positive values are clamped |
 
 Cache opt-in is incompatible with raw TCP/UDP leases.
+
+Relays accept at most 4,096 simultaneous live leases (128 per source IP) and
+2,048 outstanding registration challenges. Capacity denials return HTTP 429
+(`rate_limited`). Expired leases and challenges free slots; admins can evict
+live leases immediately.
 
 `RegisterChallengeResponse`:
 
@@ -168,6 +173,9 @@ for the delegated capability and gateway-to-ingress protocol flow.
 | `ttl` | `number` | no |
 | `reported_ip` | `string` | no |
 | `metadata` | `LeaseMetadata` | no |
+
+Renewal uses the same 120-second default and 600-second maximum as registration.
+A rejected TTL leaves the existing lease unchanged.
 
 `RenewResponse`:
 
