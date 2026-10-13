@@ -32,6 +32,33 @@ func newTestReputationAPI(t *testing.T) *RelayAPI {
 	return api
 }
 
+func TestRelayInstallerEndpointsDoNotServeExecutableCode(t *testing.T) {
+	api := newTestReputationAPI(t)
+	for _, path := range []string{types.PathInstallShell, types.PathInstallPowerShell} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+			t.Run(method+path, func(t *testing.T) {
+				response := httptest.NewRecorder()
+				api.Handler().ServeHTTP(response, httptest.NewRequest(method, path, nil))
+				want := http.StatusGone
+				if method == http.MethodPost {
+					want = http.StatusMethodNotAllowed
+				}
+				if response.Code != want {
+					t.Fatalf("status = %d, want %d", response.Code, want)
+				}
+				if method == http.MethodGet {
+					if !strings.Contains(response.Body.String(), "https://github.com/gosuda/portal-tunnel/releases/latest/download") {
+						t.Fatalf("missing official installation instructions: %s", response.Body.String())
+					}
+					if strings.Contains(response.Body.String(), "BASE_URL=") || strings.Contains(response.Body.String(), "| bash") {
+						t.Fatal("relay returned executable installation code")
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestReputationHTTPValidationAndRateLimit(t *testing.T) {
 	api := newTestReputationAPI(t)
 	post := func(body string) *httptest.ResponseRecorder {
