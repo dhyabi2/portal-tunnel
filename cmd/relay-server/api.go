@@ -660,16 +660,22 @@ func serveInstallBinary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "artifact version does not match this relay", http.StatusConflict)
 		return
 	}
+	releasePath := "/latest/download/"
+	if requestedVersion != "" {
+		releasePath = "/download/" + url.PathEscape(types.ReleaseVersion) + "/"
+	}
+	redirectURL := types.OfficialReleaseBaseURL + releasePath + filename
+	if checksumRequest {
+		redirectURL += ".sha256"
+	}
+	// A relay may serve browser assets, but must not publish native executables
+	// or their checksums. Native downloads go to the official release publisher.
+	if slug != "js-wasm" && slug != "wasm-exec" {
+		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+		return
+	}
 	data, err := embeddedDistFS.ReadFile("dist/tunnel/" + filename)
 	if err != nil {
-		releasePath := "/latest/download/"
-		if requestedVersion != "" {
-			releasePath = "/download/" + url.PathEscape(types.ReleaseVersion) + "/"
-		}
-		redirectURL := types.OfficialReleaseBaseURL + releasePath + filename
-		if checksumRequest {
-			redirectURL += ".sha256"
-		}
 		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 		return
 	}
