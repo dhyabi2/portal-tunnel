@@ -70,8 +70,7 @@ var excludedGatewayRanges = [...]netip.Prefix{
 
 func validatePublicGatewayIP(ip netip.Addr) error {
 	ip = ip.Unmap()
-	if !ip.IsValid() || ip.Zone() != "" || !ip.IsGlobalUnicast() || ip.IsPrivate() ||
-		ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+	if nonPublicGatewayAddr(ip) {
 		return fmt.Errorf("overlay gateway address %s is not public", ip)
 	}
 	for _, excluded := range excludedGatewayRanges {
@@ -80,6 +79,18 @@ func validatePublicGatewayIP(ip netip.Addr) error {
 		}
 	}
 	return nil
+}
+
+// nonPublicGatewayAddr reports whether the address is unusable as a public
+// overlay gateway: invalid, zoned, non-unicast, or in a local-use range.
+func nonPublicGatewayAddr(ip netip.Addr) bool {
+	if !ip.IsValid() || ip.Zone() != "" {
+		return true
+	}
+	if !ip.IsGlobalUnicast() {
+		return true
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
 }
 
 // ControlContext runs for each resolved IP immediately before connect, so
