@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,6 +172,36 @@ func TestLeaseRegistryLifecycle(t *testing.T) {
 	}
 	if _, ok := registry.Lookup("demo.example.com"); ok {
 		t.Fatal("Lookup() after Unregister() = true, want false")
+	}
+}
+
+func TestLeaseRegistryInvalidRenewPreservesLease(t *testing.T) {
+	t.Parallel()
+
+	registry := newTestRegistry(t, false, false)
+	record, registered, err := registry.Register(types.RegisterChallengeRequest{
+		Identity: newTestLeaseIdentity(t, "invalid-renew"),
+		TTL:      60,
+		Metadata: types.LeaseMetadata{Description: "original", Tags: []string{"original"}},
+	}, netip.MustParseAddr("203.0.113.10"), "198.51.100.10", types.RelayDescriptor{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := registry.publicLease(record)
+	beforeSource, beforeReported := record.sourceAddr, record.ReportedIP
+	if _, _, err := registry.Renew(types.RenewRequest{
+		AccessToken: registered.AccessToken,
+		TTL:         600,
+		ReportedIP:  "198.51.100.11",
+		Metadata:    types.LeaseMetadata{Description: strings.Repeat("a", 4097)},
+	}, netip.MustParseAddr("203.0.113.11")); err == nil {
+		t.Fatal("Renew() accepted oversized metadata")
+	}
+	if after := registry.publicLease(record); !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected Renew() changed lease: before=%+v after=%+v", before, after)
+	}
+	if record.sourceAddr != beforeSource || record.ReportedIP != beforeReported {
+		t.Fatal("rejected Renew() changed source or reported IP")
 	}
 }
 
@@ -495,43 +527,47 @@ func TestLeaseRegistryCleanupExpiredPreservesIdentityBPS(t *testing.T) {
 	}
 }
 
-func TestIssueRegisterChallengeBoundsPendingPerIP(t *testing.T) {
+func TestIssueRegisterChallengeBoundsPending(t *testing.T) {
 	t.Parallel()
-
-	registry := newTestRegistry(t, false, false)
-	sourceAddr := netip.MustParseAddr("203.0.113.50")
-	for i := range defaultRegisterChallengeOutstandingPerIP {
-		_, err := registry.issueRegisterChallenge(types.RegisterChallengeRequest{
-			Identity: newTestLeaseIdentity(t, fmt.Sprintf("demo-%d", i)),
-		}, "example.com", "https://example.com"+types.PathSDKRegister, sourceAddr)
-		if err != nil {
-			t.Fatalf("issueRegisterChallenge(%d) error = %v", i, err)
-		}
-	}
-
-	_, err := registry.issueRegisterChallenge(types.RegisterChallengeRequest{
-		Identity: newTestLeaseIdentity(t, "overflow"),
-	}, "example.com", "https://example.com"+types.PathSDKRegister, sourceAddr)
-	if !errors.Is(err, errRegisterChallengePending) {
-		t.Fatalf("issueRegisterChallenge() error = %v, want pending limit", err)
-	}
-
-	expiredAt := time.Now().Add(-time.Second)
-	registry.mu.Lock()
-	for _, record := range registry.records {
-		if record == nil || record.registerChallenge == nil {
-			continue
-		}
-		record.ExpiresAt = expiredAt
-		record.registerChallenge.ExpiresAt = expiredAt
-	}
-	registry.mu.Unlock()
-
-	_, err = registry.issueRegisterChallenge(types.RegisterChallengeRequest{
-		Identity: newTestLeaseIdentity(t, "after-cleanup"),
-	}, "example.com", "https://example.com"+types.PathSDKRegister, sourceAddr)
-	if err != nil {
-		t.Fatalf("issueRegisterChallenge() after expired cleanup error = %v", err)
+	for _, tc := range []struct {
+		name  string
+		limit int
+	}{
+		{"per IP", defaultRegisterChallengeOutstandingPerIP},
+		{"global", defaultRegisterChallengeOutstanding},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := newTestRegistry(t, false, false)
+			sourceAddr := netip.MustParseAddr("203.0.113.50")
+			request := types.RegisterChallengeRequest{Identity: newTestLeaseIdentity(t, "pending")}
+			for i := range tc.limit {
+				if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, sourceAddr); err != nil {
+					t.Fatalf("issueRegisterChallenge(%d) error = %v", i, err)
+				}
+				if tc.name == "global" {
+					sourceAddr = sourceAddr.Next()
+				}
+			}
+			if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, sourceAddr); !errors.Is(err, errRegisterChallengePending) {
+				t.Fatalf("issueRegisterChallenge() error = %v, want pending limit", err)
+			}
+			if len(registry.records) != tc.limit {
+				t.Fatal("rejected challenge was retained")
+			}
+			expiredAt := time.Now().Add(-time.Second)
+			registry.mu.Lock()
+			for _, record := range registry.records {
+				record.ExpiresAt = expiredAt
+				record.registerChallenge.ExpiresAt = expiredAt
+			}
+			registry.mu.Unlock()
+			if _, err := registry.issueRegisterChallenge(request, "example.com", "https://example.com"+types.PathSDKRegister, sourceAddr); err != nil {
+				t.Fatalf("issueRegisterChallenge() after expired cleanup error = %v", err)
+			}
+			if len(registry.records) != 1 {
+				t.Fatal("expired challenges were retained")
+			}
+		})
 	}
 }
 

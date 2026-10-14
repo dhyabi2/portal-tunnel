@@ -27,6 +27,7 @@ const (
 	defaultLeaseTTL                          = 2 * time.Minute
 	defaultRegisterChallengeTTL              = 2 * time.Minute
 	defaultRegisterChallengeOutstandingPerIP = 32
+	defaultRegisterChallengeOutstanding      = 256
 	defaultPortReservationGrace              = 5 * time.Minute
 	defaultIdleKeepalive                     = 15 * time.Second
 	defaultReadyQueueLimit                   = 8
@@ -325,6 +326,9 @@ func (r *leaseRegistry) Register(req types.RegisterChallengeRequest, sourceAddr 
 	if r == nil {
 		return nil, types.RegisterResponse{}, errFeatureUnavailable
 	}
+	if err := req.Metadata.Validate(); err != nil {
+		return nil, types.RegisterResponse{}, err
+	}
 	leaseIdentity := req.Identity
 
 	ttl := defaultLeaseTTL
@@ -582,6 +586,9 @@ func (r *leaseRegistry) Renew(req types.RenewRequest, sourceAddr netip.Addr) (ty
 	if err != nil {
 		return types.RenewResponse{}, reverseEndpointInput{}, errUnauthorized
 	}
+	if err := req.Metadata.Validate(); err != nil {
+		return types.RenewResponse{}, reverseEndpointInput{}, err
+	}
 	ttl := defaultLeaseTTL
 	if req.TTL > 0 {
 		ttl = time.Duration(req.TTL) * time.Second
@@ -747,6 +754,7 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 	defer r.mu.Unlock()
 
 	pending := 0
+	globalPending := 0
 	for i := 0; i < len(r.records); {
 		record := r.records[i]
 		if record != nil && record.registerChallenge != nil {
@@ -754,13 +762,14 @@ func (r *leaseRegistry) issueRegisterChallenge(req types.RegisterChallengeReques
 				r.deleteRecord(i)
 				continue
 			}
+			globalPending++
 			if record.sourceAddr == sourceAddr {
 				pending++
 			}
 		}
 		i++
 	}
-	if pending >= defaultRegisterChallengeOutstandingPerIP {
+	if pending >= defaultRegisterChallengeOutstandingPerIP || globalPending >= defaultRegisterChallengeOutstanding {
 		return types.RegisterChallengeResponse{}, errRegisterChallengePending
 	}
 	r.records = append(r.records, &leaseRecord{
