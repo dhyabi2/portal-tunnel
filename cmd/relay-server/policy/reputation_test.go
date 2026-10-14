@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"net/netip"
 	"path/filepath"
 	"strconv"
@@ -146,7 +147,7 @@ func TestReputationAtCapacityExistingVoterCanChangeVote(t *testing.T) {
 		t.Fatalf("CastVote(existing voter at capacity) = %+v, err=%v, want one updated vote", updated, err)
 	}
 	otherSource := netip.MustParseAddr("203.0.113.11")
-	if _, _, err := store.CastVote(hostname, identity, VoteUp, "", otherSource); err != ErrReputationCapacity {
+	if _, _, err := store.CastVote(hostname, identity, VoteUp, "", otherSource); !errors.Is(err, ErrReputationCapacity) {
 		t.Fatalf("CastVote(new voter at capacity) error = %v, want %v", err, ErrReputationCapacity)
 	}
 	updated, _, err = store.CastVote(hostname, identity, VoteUp, cookie, otherSource)
