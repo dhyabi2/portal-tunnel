@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,7 +166,7 @@ func (s *Server) HandleRelayDiscovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	utils.WriteAPIData(w, http.StatusOK, types.DiscoveryResponse{
+	writeDiscoveryResponse(w, types.DiscoveryResponse{
 		ProtocolVersion:      types.DiscoveryVersion,
 		GeneratedAt:          now,
 		Relays:               s.relaySet.Descriptors(self),
@@ -173,6 +174,48 @@ func (s *Server) HandleRelayDiscovery(w http.ResponseWriter, r *http.Request) {
 		ReleaseVersion:       types.ReleaseVersion,
 		RelayReleaseVersions: s.relaySet.KnownRelayReleaseVersions(),
 	})
+}
+
+// writeDiscoveryResponse keeps the response within the client byte limit.
+// On overflow, omit unsigned observations and retain the largest relay prefix,
+// preserving the serving relay at index zero.
+func writeDiscoveryResponse(w http.ResponseWriter, response types.DiscoveryResponse) {
+	response.Relays = response.Relays[:min(len(response.Relays), types.MaxDiscoveryEntries+1)]
+	encoded, err := json.Marshal(types.APIEnvelope[types.DiscoveryResponse]{OK: true, Data: response})
+	if err != nil {
+		utils.WriteAPIError(w, http.StatusInternalServerError, types.APIErrorCodeInternal, err.Error())
+		return
+	}
+	if int64(len(encoded)) > types.MaxDiscoveryResponseBytes {
+		response.IncompatibleRelays = nil
+		response.RelayReleaseVersions = nil
+		encoded = nil
+		// Serialized size grows with the prefix length. Search in at most
+		// eleven encodings for the bounded set of 1,025 descriptors.
+		for low, high := 1, len(response.Relays); low <= high; {
+			count := low + (high-low)/2
+			candidate := response
+			candidate.Relays = response.Relays[:count]
+			body, err := json.Marshal(types.APIEnvelope[types.DiscoveryResponse]{OK: true, Data: candidate})
+			if err != nil {
+				utils.WriteAPIError(w, http.StatusInternalServerError, types.APIErrorCodeInternal, err.Error())
+				return
+			}
+			if int64(len(body)) > types.MaxDiscoveryResponseBytes {
+				high = count - 1
+			} else {
+				encoded = body
+				low = count + 1
+			}
+		}
+		if encoded == nil {
+			utils.WriteAPIError(w, http.StatusInternalServerError, types.APIErrorCodeInternal, "self descriptor exceeds discovery response limit")
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(encoded)
 }
 
 func (s *Server) HandleRelayDiscoveryAnnounce(w http.ResponseWriter, r *http.Request, sourceAddr netip.Addr) {

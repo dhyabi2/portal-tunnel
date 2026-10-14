@@ -530,6 +530,9 @@ func (s *RelaySet) discoveryRelayStateLocked(
 }
 
 func (s *RelaySet) ApplyRelayDiscoveryResponse(targetURL string, resp types.DiscoveryResponse, now time.Time) (relaySetChanged bool, err error) {
+	if len(resp.Relays) > MaxAnnouncedRelays+1 || len(resp.IncompatibleRelays) > MaxAnnouncedRelays || len(resp.RelayReleaseVersions) > MaxAnnouncedRelays {
+		return false, fmt.Errorf("discovery response exceeds collection limits (relays: %d, metadata: %d)", MaxAnnouncedRelays+1, MaxAnnouncedRelays)
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -629,11 +632,37 @@ func (s *RelaySet) recordIncompatibleRelayLocked(relayURL, protocolVersion strin
 		return
 	}
 	s.pruneIncompatibleLocked(now)
+	if len(protocolVersion) > types.MaxDiscoveryVersionBytes {
+		protocolVersion = ""
+	}
 	s.incompatible[relayURL] = types.IncompatibleRelayEntry{
 		URL:             relayURL,
 		ProtocolVersion: protocolVersion,
 		LastSeenAt:      now,
 	}
+	if len(s.incompatible) > MaxAnnouncedRelays {
+		var oldestURL string
+		var oldestAt time.Time
+		for url, observation := range s.incompatible {
+			if olderObservation(url, observation.LastSeenAt, oldestURL, oldestAt) {
+				oldestURL, oldestAt = url, observation.LastSeenAt
+			}
+		}
+		delete(s.incompatible, oldestURL)
+	}
+}
+
+// olderObservation reports whether the candidate observation is older than the
+// tracked oldest, breaking equal timestamps on the relay URL so eviction is
+// deterministic.
+func olderObservation(url string, observedAt time.Time, oldestURL string, oldestAt time.Time) bool {
+	if oldestURL == "" {
+		return true
+	}
+	if observedAt.Before(oldestAt) {
+		return true
+	}
+	return observedAt.Equal(oldestAt) && url < oldestURL
 }
 
 // pruneIncompatibleLocked drops incompatible-relay entries whose last direct
@@ -672,13 +701,23 @@ func (s *RelaySet) recordReleaseObservationLocked(relayURL, releaseVersion strin
 	}
 	s.pruneReleaseVersionsLocked(now)
 	releaseVersion = strings.TrimSpace(releaseVersion)
-	if releaseVersion == "" {
+	if releaseVersion == "" || len(releaseVersion) > types.MaxDiscoveryVersionBytes {
 		delete(s.releaseVersions, relayURL)
 		return
 	}
 	s.releaseVersions[relayURL] = relayReleaseObservation{
 		releaseVersion: releaseVersion,
 		observedAt:     now,
+	}
+	if len(s.releaseVersions) > MaxAnnouncedRelays {
+		var oldestURL string
+		var oldestAt time.Time
+		for url, observation := range s.releaseVersions {
+			if olderObservation(url, observation.observedAt, oldestURL, oldestAt) {
+				oldestURL, oldestAt = url, observation.observedAt
+			}
+		}
+		delete(s.releaseVersions, oldestURL)
 	}
 }
 

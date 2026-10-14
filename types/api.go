@@ -112,6 +112,17 @@ type RegisterResponse struct {
 	TCPEnabled        bool            `json:"tcp_enabled,omitempty"`
 }
 
+// MaxDiscoveryResponseBytes is the decoded-byte budget for both discovery
+// readers and producers.
+const MaxDiscoveryResponseBytes int64 = 1 << 20
+
+// MaxDiscoveryEntries bounds retained relay peers and each metadata collection.
+// The relays wire field permits one additional descriptor for the serving relay.
+const MaxDiscoveryEntries = 1024
+
+// MaxDiscoveryVersionBytes bounds untrusted protocol and release labels.
+const MaxDiscoveryVersionBytes = 128
+
 type DiscoveryResponse struct {
 	ProtocolVersion    string                   `json:"protocol_version"`
 	GeneratedAt        time.Time                `json:"generated_at"`

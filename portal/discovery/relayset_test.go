@@ -2,6 +2,8 @@ package discovery
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -466,5 +468,63 @@ func TestKnownRelayReleaseVersionsExpireWithoutFreshDirectPoll(t *testing.T) {
 	}
 	if versions := set.knownRelayReleaseVersionsAt(t0.Add(AnnounceMaxValidity).Add(time.Second)); len(versions) != 0 {
 		t.Fatalf("knownRelayReleaseVersionsAt(validity+1s) = %+v, want empty: gossip must not extend the direct clock", versions)
+	}
+}
+
+func TestApplyRelayDiscoveryResponseCollectionLimit(t *testing.T) {
+	t.Parallel()
+	for _, count := range []int{MaxAnnouncedRelays + 1, MaxAnnouncedRelays + 2} {
+		set := NewRelaySet(nil)
+		changed, err := set.ApplyRelayDiscoveryResponse("", types.DiscoveryResponse{
+			Relays: make([]types.RelayDescriptor, count),
+		}, time.Now())
+		if (err != nil) != (count > MaxAnnouncedRelays+1) || changed {
+			t.Fatalf("collection size %d: changed=%v, error=%v", count, changed, err)
+		}
+	}
+}
+
+func TestDiscoveryObservationMapsStayBounded(t *testing.T) {
+	t.Parallel()
+
+	set := NewRelaySet(nil)
+	now := time.Now().UTC()
+	set.mu.Lock()
+	for i := range MaxAnnouncedRelays + 1 {
+		relayURL := fmt.Sprintf("https://observed-%d.example", i)
+		observedAt := now.Add(time.Duration(i) * time.Millisecond)
+		set.recordReleaseObservationLocked(relayURL, "v2.6.0", observedAt)
+		set.recordIncompatibleRelayLocked(relayURL, "older", observedAt)
+	}
+	set.mu.Unlock()
+
+	if len(set.releaseVersions) != MaxAnnouncedRelays || len(set.incompatible) != MaxAnnouncedRelays {
+		t.Fatalf("retained observations = (releases %d, incompatible %d), want %d each",
+			len(set.releaseVersions), len(set.incompatible), MaxAnnouncedRelays)
+	}
+	if _, ok := set.releaseVersions["https://observed-0.example"]; ok {
+		t.Fatal("oldest release observation was not evicted")
+	}
+	if _, ok := set.incompatible["https://observed-0.example"]; ok {
+		t.Fatal("oldest incompatible observation was not evicted")
+	}
+}
+
+func TestDiscoveryObservationLabelsStayBounded(t *testing.T) {
+	t.Parallel()
+
+	set := NewRelaySet(nil)
+	relayURL := "https://peer.example"
+	large := strings.Repeat("v", types.MaxDiscoveryVersionBytes+1)
+	set.mu.Lock()
+	set.recordReleaseObservationLocked(relayURL, large, time.Now().UTC())
+	set.recordIncompatibleRelayLocked(relayURL, large, time.Now().UTC())
+	set.mu.Unlock()
+
+	if len(set.releaseVersions) != 0 {
+		t.Fatalf("retained %d oversized release labels", len(set.releaseVersions))
+	}
+	if entry, ok := set.incompatible[relayURL]; !ok || entry.ProtocolVersion != "" {
+		t.Fatalf("oversized protocol label stored: %+v (exists: %t)", entry, ok)
 	}
 }
