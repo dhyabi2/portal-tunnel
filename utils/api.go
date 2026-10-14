@@ -246,7 +246,7 @@ func DecodeJSONRequestAs[T any](w http.ResponseWriter, r *http.Request, maxBytes
 func decodeJSONRequestBody[T any](w http.ResponseWriter, r *http.Request, maxBytes int64) (T, error) {
 	var dst T
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	defer r.Body.Close()
+	// The HTTP server owns body closure; connection deadlines belong to handlers.
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&dst); err != nil {
 		return dst, err
