@@ -134,7 +134,7 @@ func reverseMuxEnded(mux *transport.ReverseMux) bool {
 }
 
 func validatePublicReverseHostname(host string) error {
-	if utils.IsLocalRelayHost(host) {
+	if utils.IsLocalOnlyRelayHost(host) {
 		return fmt.Errorf("overlay gateway host %q is local-only", host)
 	}
 	if addr, err := netip.ParseAddr(host); err == nil && !utils.IsPublicIP(addr) {

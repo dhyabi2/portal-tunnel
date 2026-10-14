@@ -23,7 +23,7 @@ func requirePublicRelayURL(raw string) error {
 		return errors.New("discovered relay must have a public HTTPS URL")
 	}
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
-	if utils.IsLocalRelayHost(host) {
+	if utils.IsLocalOnlyRelayHost(host) {
 		return fmt.Errorf("discovered relay host %q is local-only", host)
 	}
 	if ip, err := netip.ParseAddr(host); err == nil && !utils.IsPublicIP(ip) {

@@ -449,19 +449,25 @@ func EnsurePort(host string) string {
 	return net.JoinHostPort(host, "443")
 }
 
+// IsLocalRelayHost identifies the existing local-development TLS trust exception.
 func IsLocalRelayHost(host string) bool {
 	host = NormalizeHostname(host)
 	switch host {
 	case "", "localhost":
 		return true
 	}
-	if strings.Contains(host, "%") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".localhost") {
-		return true
-	}
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.IsLoopback()
 	}
-	return false
+	return strings.HasSuffix(host, ".localhost")
+}
+
+// IsLocalOnlyRelayHost rejects locally scoped destinations for public relay
+// discovery and overlay gateways. It must not widen local TLS trust.
+// Other non-public IP literals and resolved addresses still require IsPublicIP.
+func IsLocalOnlyRelayHost(host string) bool {
+	host = NormalizeHostname(host)
+	return IsLocalRelayHost(host) || strings.Contains(host, "%") || strings.HasSuffix(host, ".local")
 }
 
 func SleepOrDone(ctx context.Context, d time.Duration) bool {

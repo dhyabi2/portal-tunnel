@@ -264,29 +264,34 @@ func TestNormalizeTargetAddrIPv6(t *testing.T) {
 	}
 }
 
-func TestIsLocalRelayHost(t *testing.T) {
+func TestRelayHostTrustBoundaries(t *testing.T) {
 	for _, tc := range []struct {
-		host string
-		want bool
+		host      string
+		localTLS  bool
+		localOnly bool
 	}{
-		{"", true},
-		{"localhost", true},
-		{"LOCALHOST", true},
-		{"sub.localhost", true},
-		{"my.app.localhost.", true},
-		{"relay.local", true},
-		{"app.relay.LOCAL.", true},
-		{"fe80::1%eth0", true},
-		{"127.0.0.1", true},
-		{"127.0.0.2", true},
-		{"::1", true},
-		{"relay.example.com", false},
-		{"192.0.2.1", false},
-		{"203.0.113.1", false},
+		{"", true, true},
+		{"localhost", true, true},
+		{"LOCALHOST", true, true},
+		{"sub.localhost", true, true},
+		{"my.app.localhost.", true, true},
+		{"relay.local", false, true},
+		{"app.relay.LOCAL.", false, true},
+		{"fe80::1%eth0", false, true},
+		{"2001:4860:4860::8888%eth0", false, true},
+		{"127.0.0.1", true, true},
+		{"127.0.0.2", true, true},
+		{"::1", true, true},
+		{"relay.example.com", false, false},
+		{"192.0.2.1", false, false},
+		{"203.0.113.1", false, false},
 	} {
 		t.Run(tc.host, func(t *testing.T) {
-			if got := IsLocalRelayHost(tc.host); got != tc.want {
-				t.Fatalf("IsLocalRelayHost(%q) = %v, want %v", tc.host, got, tc.want)
+			if got := IsLocalRelayHost(tc.host); got != tc.localTLS {
+				t.Fatalf("IsLocalRelayHost(%q) = %v, want %v", tc.host, got, tc.localTLS)
+			}
+			if got := IsLocalOnlyRelayHost(tc.host); got != tc.localOnly {
+				t.Fatalf("IsLocalOnlyRelayHost(%q) = %v, want %v", tc.host, got, tc.localOnly)
 			}
 		})
 	}
