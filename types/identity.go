@@ -6,6 +6,9 @@ import (
 	"time"
 )
 
+// RegisterLeaseSIWEStatement is the canonical purpose signed for Portal lease registration.
+const RegisterLeaseSIWEStatement = "Register a portal lease"
+
 const (
 	IdentityKeySeparator  = ":"
 	RelayIdentityFilename = "identity.json"
@@ -120,6 +123,24 @@ type LeaseMetadata struct {
 	Hide        bool     `json:"hide,omitempty"`
 }
 
+// Validate bounds metadata retained by the relay, including unauthenticated challenges.
+func (m LeaseMetadata) Validate() error {
+	if len(m.Description) > 4096 || len(m.Owner) > 256 || len(m.Thumbnail) > 2048 || len(m.Tags) > 32 {
+		return fmt.Errorf("lease metadata exceeds limits")
+	}
+	total := len(m.Description) + len(m.Owner) + len(m.Thumbnail)
+	for _, tag := range m.Tags {
+		if len(tag) > 128 {
+			return fmt.Errorf("lease metadata tag exceeds limit")
+		}
+		total += len(tag)
+	}
+	if total > 8192 {
+		return fmt.Errorf("lease metadata exceeds aggregate limit")
+	}
+	return nil
+}
+
 func (m LeaseMetadata) Copy() LeaseMetadata {
 	return LeaseMetadata{
 		Description: m.Description,
@@ -156,6 +177,13 @@ type PolicyLease struct {
 	IsBanned    bool   `json:"is_banned"`
 	IsDenied    bool   `json:"is_denied"`
 }
+
+// Relay descriptor addresses must stay small enough to share the discovery budget.
+const (
+	MaxRelayDescriptorURLBytes         = 2048
+	MaxRelayDescriptorDestinationBytes = 60 // 52-character hash plus .b32.i2p.
+	MaxRelayDescriptorSignatureBytes   = 88 // Base64-encoded 65-byte compact signature.
+)
 
 type RelayDescriptor struct {
 	Address           string    `json:"address"`

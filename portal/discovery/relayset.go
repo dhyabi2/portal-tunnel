@@ -504,19 +504,24 @@ func (s *RelaySet) EnsureRelayURL(relayURL string) {
 	s.relays[relayURL] = newRelayState(relayURL)
 }
 
-// discoveryRelayStateLocked is the cryptographic gate for every gossiped
-// descriptor. The caller must hold s.mu for reading the URL ban state.
+// discoveryRelayStateLocked enforces signature and public-address policy for
+// discovery responses. The caller must hold s.mu for bootstrap and ban state.
 func (s *RelaySet) discoveryRelayStateLocked(
 	descriptor types.RelayDescriptor,
 	now time.Time,
+	targetURL string,
 ) (RelayState, string, bool) {
 	verified, err := verifyFreshRelayDescriptor(descriptor, now)
 	if err != nil {
 		return RelayState{}, "", false
 	}
 	relayURL := verified.APIHTTPSAddr
-	if relayURL == "" {
-		return RelayState{}, "", false
+	if err := requirePublicRelayURL(relayURL); err != nil {
+		// Only a direct response from an explicitly configured bootstrap
+		// relay may advertise its own local/private URL.
+		if relayURL != targetURL || !s.relays[relayURL].Bootstrap {
+			return RelayState{}, "", false
+		}
 	}
 	if existing, ok := s.relays[relayURL]; ok && existing.Banned {
 		return RelayState{}, "", false
@@ -525,6 +530,9 @@ func (s *RelaySet) discoveryRelayStateLocked(
 }
 
 func (s *RelaySet) ApplyRelayDiscoveryResponse(targetURL string, resp types.DiscoveryResponse, now time.Time) (relaySetChanged bool, err error) {
+	if len(resp.Relays) > MaxAnnouncedRelays+1 || len(resp.IncompatibleRelays) > MaxAnnouncedRelays || len(resp.RelayReleaseVersions) > MaxAnnouncedRelays {
+		return false, fmt.Errorf("discovery response exceeds collection limits (relays: %d, metadata: %d)", MaxAnnouncedRelays+1, MaxAnnouncedRelays)
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -541,7 +549,7 @@ func (s *RelaySet) ApplyRelayDiscoveryResponse(targetURL string, resp types.Disc
 	discoveredOrder := make([]string, 0, len(resp.Relays)+1)
 	targetFound := false
 	for _, descriptor := range resp.Relays {
-		relayState, relayURL, ok := s.discoveryRelayStateLocked(descriptor, now)
+		relayState, relayURL, ok := s.discoveryRelayStateLocked(descriptor, now, targetURL)
 		if !ok {
 			continue
 		}
@@ -624,11 +632,37 @@ func (s *RelaySet) recordIncompatibleRelayLocked(relayURL, protocolVersion strin
 		return
 	}
 	s.pruneIncompatibleLocked(now)
+	if len(protocolVersion) > types.MaxDiscoveryVersionBytes {
+		protocolVersion = ""
+	}
 	s.incompatible[relayURL] = types.IncompatibleRelayEntry{
 		URL:             relayURL,
 		ProtocolVersion: protocolVersion,
 		LastSeenAt:      now,
 	}
+	if len(s.incompatible) > MaxAnnouncedRelays {
+		var oldestURL string
+		var oldestAt time.Time
+		for url, observation := range s.incompatible {
+			if olderObservation(url, observation.LastSeenAt, oldestURL, oldestAt) {
+				oldestURL, oldestAt = url, observation.LastSeenAt
+			}
+		}
+		delete(s.incompatible, oldestURL)
+	}
+}
+
+// olderObservation reports whether the candidate observation is older than the
+// tracked oldest, breaking equal timestamps on the relay URL so eviction is
+// deterministic.
+func olderObservation(url string, observedAt time.Time, oldestURL string, oldestAt time.Time) bool {
+	if oldestURL == "" {
+		return true
+	}
+	if observedAt.Before(oldestAt) {
+		return true
+	}
+	return observedAt.Equal(oldestAt) && url < oldestURL
 }
 
 // pruneIncompatibleLocked drops incompatible-relay entries whose last direct
@@ -667,13 +701,23 @@ func (s *RelaySet) recordReleaseObservationLocked(relayURL, releaseVersion strin
 	}
 	s.pruneReleaseVersionsLocked(now)
 	releaseVersion = strings.TrimSpace(releaseVersion)
-	if releaseVersion == "" {
+	if releaseVersion == "" || len(releaseVersion) > types.MaxDiscoveryVersionBytes {
 		delete(s.releaseVersions, relayURL)
 		return
 	}
 	s.releaseVersions[relayURL] = relayReleaseObservation{
 		releaseVersion: releaseVersion,
 		observedAt:     now,
+	}
+	if len(s.releaseVersions) > MaxAnnouncedRelays {
+		var oldestURL string
+		var oldestAt time.Time
+		for url, observation := range s.releaseVersions {
+			if olderObservation(url, observation.observedAt, oldestURL, oldestAt) {
+				oldestURL, oldestAt = url, observation.observedAt
+			}
+		}
+		delete(s.releaseVersions, oldestURL)
 	}
 }
 
@@ -776,6 +820,9 @@ func (s *RelaySet) InsertCandidate(desc types.RelayDescriptor, now time.Time) er
 
 	normalized, err := verifyFreshRelayDescriptor(desc, now)
 	if err != nil {
+		return err
+	}
+	if err := requirePublicRelayURL(normalized.APIHTTPSAddr); err != nil {
 		return err
 	}
 

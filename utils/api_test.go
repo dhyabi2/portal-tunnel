@@ -1,11 +1,15 @@
 package utils
 
 import (
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -108,5 +112,62 @@ func TestDecodeAPIRequestErrorRetryAfter(t *testing.T) {
 		} else if apiErr.RetryAfter != 0 {
 			t.Fatalf("invalid header %q = %v", header, apiErr.RetryAfter)
 		}
+	}
+}
+
+func TestHTTPDoAPIPathRejectsOversizedDiscovery(t *testing.T) {
+	t.Parallel()
+	for _, encoding := range []string{"declared length", "chunked", "gzip"} {
+		t.Run(encoding, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				switch encoding {
+				case "declared length":
+					w.Header().Set("Content-Length", strconv.FormatInt(types.MaxDiscoveryResponseBytes+1, 10))
+					w.WriteHeader(http.StatusOK)
+				case "chunked":
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+					_, _ = io.WriteString(w, strings.Repeat("x", int(types.MaxDiscoveryResponseBytes+1)))
+				case "gzip":
+					w.Header().Set("Content-Encoding", "gzip")
+					writer := gzip.NewWriter(w)
+					_, _ = io.WriteString(writer, strings.Repeat("x", int(types.MaxDiscoveryResponseBytes+1)))
+					_ = writer.Close()
+				}
+			}))
+			defer server.Close()
+			base, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := HTTPDoAPIPath(context.Background(), server.Client(), base, http.MethodGet, types.PathDiscovery, nil, nil, nil); !errors.Is(err, ErrAPIResponseTooLarge) {
+				t.Fatalf("response error = %v, want ErrAPIResponseTooLarge", err)
+			}
+		})
+	}
+}
+
+func TestHTTPDoAPIPathAcceptsDiscoveryAtLimit(t *testing.T) {
+	t.Parallel()
+
+	const prefix = "{\"ok\":true,\"data\":{\"value\":\""
+	const suffix = "\"}}"
+	padding := int(types.MaxDiscoveryResponseBytes) - len(prefix) - len(suffix)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, prefix+strings.Repeat("x", padding)+suffix)
+	}))
+	defer server.Close()
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data struct {
+		Value string `json:"value"`
+	}
+	if err := HTTPDoAPIPath(context.Background(), server.Client(), base, http.MethodGet, types.PathDiscovery, nil, nil, &data); err != nil {
+		t.Fatalf("HTTPDoAPIPath() error = %v, want success", err)
+	}
+	if len(data.Value) != padding {
+		t.Fatalf("value size = %d, want %d", len(data.Value), padding)
 	}
 }

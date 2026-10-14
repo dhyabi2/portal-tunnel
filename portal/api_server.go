@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,7 +166,7 @@ func (s *Server) HandleRelayDiscovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	utils.WriteAPIData(w, http.StatusOK, types.DiscoveryResponse{
+	writeDiscoveryResponse(w, types.DiscoveryResponse{
 		ProtocolVersion:      types.DiscoveryVersion,
 		GeneratedAt:          now,
 		Relays:               s.relaySet.Descriptors(self),
@@ -173,6 +174,48 @@ func (s *Server) HandleRelayDiscovery(w http.ResponseWriter, r *http.Request) {
 		ReleaseVersion:       types.ReleaseVersion,
 		RelayReleaseVersions: s.relaySet.KnownRelayReleaseVersions(),
 	})
+}
+
+// writeDiscoveryResponse keeps the response within the client byte limit.
+// On overflow, omit unsigned observations and retain the largest relay prefix,
+// preserving the serving relay at index zero.
+func writeDiscoveryResponse(w http.ResponseWriter, response types.DiscoveryResponse) {
+	response.Relays = response.Relays[:min(len(response.Relays), types.MaxDiscoveryEntries+1)]
+	encoded, err := json.Marshal(types.APIEnvelope[types.DiscoveryResponse]{OK: true, Data: response})
+	if err != nil {
+		utils.WriteAPIError(w, http.StatusInternalServerError, types.APIErrorCodeInternal, err.Error())
+		return
+	}
+	if int64(len(encoded)) > types.MaxDiscoveryResponseBytes {
+		response.IncompatibleRelays = nil
+		response.RelayReleaseVersions = nil
+		encoded = nil
+		// Serialized size grows with the prefix length. Search in at most
+		// eleven encodings for the bounded set of 1,025 descriptors.
+		for low, high := 1, len(response.Relays); low <= high; {
+			count := low + (high-low)/2
+			candidate := response
+			candidate.Relays = response.Relays[:count]
+			body, err := json.Marshal(types.APIEnvelope[types.DiscoveryResponse]{OK: true, Data: candidate})
+			if err != nil {
+				utils.WriteAPIError(w, http.StatusInternalServerError, types.APIErrorCodeInternal, err.Error())
+				return
+			}
+			if int64(len(body)) > types.MaxDiscoveryResponseBytes {
+				high = count - 1
+			} else {
+				encoded = body
+				low = count + 1
+			}
+		}
+		if encoded == nil {
+			utils.WriteAPIError(w, http.StatusInternalServerError, types.APIErrorCodeInternal, "self descriptor exceeds discovery response limit")
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(encoded)
 }
 
 func (s *Server) HandleRelayDiscoveryAnnounce(w http.ResponseWriter, r *http.Request, sourceAddr netip.Addr) {
@@ -196,21 +239,15 @@ func (s *Server) HandleRelayDiscoveryAnnounce(w http.ResponseWriter, r *http.Req
 		utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest, err.Error())
 		return
 	}
-	// Self-announce guard: the relay's own URL is established locally, not
-	// gossiped through the announce endpoint. Validate the normalized URL so
-	// scheme-less inputs are checked the same way signature verification will
-	// check them later.
+	// The relay's own URL is established locally, not through announces.
+	// RelaySet.InsertCandidate owns the public destination policy for all
+	// untrusted descriptors, including gossiped ones.
 	announceURL, err := url.Parse(desc.APIHTTPSAddr)
 	if err != nil {
 		utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest, err.Error())
 		return
 	}
 	host := utils.NormalizeHostname(announceURL.Hostname())
-	if utils.IsLocalRelayHost(host) {
-		utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest,
-			fmt.Sprintf("self-announce rejected: host %q is local-only", host))
-		return
-	}
 	cfg := s.config()
 	if selfURL, err := utils.NormalizeRelayURL(cfg.PortalURL); err == nil && desc.APIHTTPSAddr == selfURL {
 		utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest,
@@ -344,7 +381,7 @@ func (s *Server) HandleRegister(w http.ResponseWriter, r *http.Request, sourceAd
 // HandleRegisterChallenge issues a registration challenge without publishing
 // the success response, allowing the relay to apply access state first.
 func (s *Server) HandleRegisterChallenge(w http.ResponseWriter, r *http.Request, sourceAddr netip.Addr) (types.ServiceIdentityKey, types.RegisterChallengeResponse, bool) {
-	req, ok := utils.DecodeJSONRequest[types.RegisterChallengeRequest](w, r, defaultControlBodyLimit)
+	req, ok := utils.DecodeJSONRequest[types.RegisterChallengeRequest](w, r, 64<<10)
 	if !ok {
 		return types.ServiceIdentityKey{}, types.RegisterChallengeResponse{}, false
 	}
@@ -506,7 +543,7 @@ func (s *Server) HandleConnect(w http.ResponseWriter, r *http.Request, sourceAdd
 	if s.overlay != nil && s.overlay.Handles(capability) {
 		client, gateway := s.overlay.HandleConnect(w, r, capability, sourceAddr)
 		if client != nil {
-			s.proxy.bridge(client, gateway, types.ServiceIdentityKey{}, s.registry.bps)
+			s.proxy.bridge(s.ingressCtx, client, gateway, types.ServiceIdentityKey{}, s.registry.bps)
 		}
 		return
 	}

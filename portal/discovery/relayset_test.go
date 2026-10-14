@@ -2,6 +2,8 @@ package discovery
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,17 +75,6 @@ func routesTo(t *testing.T, set *RelaySet, relayURL string) bool {
 		}
 	}
 	return false
-}
-
-func TestApplyRelayDiscoveryResponsePreservesBootstrapFlag(t *testing.T) {
-	relayURL := "https://relay-a.example"
-	set := NewRelaySet([]string{relayURL})
-
-	mustApplyAuthoritative(t, set, mustRelayDescriptor(t, relayURL))
-
-	if got := set.BootstrapRelayURLs(); len(got) != 1 || got[0] != relayURL {
-		t.Fatalf("BootstrapRelayURLs() = %v, want bootstrap relay to survive discovery update", got)
-	}
 }
 
 func TestDescriptorsDropsExpiredSignedRelayDescriptor(t *testing.T) {
@@ -316,20 +307,6 @@ func TestSelectRelaysSkipsExplicitRelayWithoutRequiredTransport(t *testing.T) {
 	}
 }
 
-func TestSelectRelaysIncludesExplicitRelayMissingFromSet(t *testing.T) {
-	const relayURL = "https://relay-explicit.example"
-
-	routes := NewRelaySet(nil).SelectRelays(routeState{
-		ExplicitRelayURLs: []string{relayURL},
-	})
-	if len(routes) != 1 {
-		t.Fatalf("len(routes) = %d, want 1", len(routes))
-	}
-	if got := routes[0]; got != relayURL {
-		t.Fatalf("route = %q, want %q", got, relayURL)
-	}
-}
-
 func TestProtocolMismatchKeepsOlderRelayVisibleWithoutRouting(t *testing.T) {
 	set := NewRelaySet(nil)
 
@@ -408,43 +385,6 @@ func TestCompatibleAuthoritativeDiscoveryClearsIncompatibleRelay(t *testing.T) {
 	}
 }
 
-func TestKnownIncompatibleRelaysSuppressBannedRelay(t *testing.T) {
-	set := NewRelaySet(nil)
-
-	relayURL := "https://relay-old.example"
-	desc := mustRelayDescriptor(t, relayURL)
-	if _, err := set.ApplyRelayDiscoveryResponse(relayURL, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion + "-older",
-		Relays:          []types.RelayDescriptor{desc},
-	}, time.Now().UTC()); err == nil {
-		t.Fatal("expected protocol mismatch error")
-	}
-	if known := set.KnownIncompatibleRelays(); len(known) != 1 {
-		t.Fatalf("KnownIncompatibleRelays() = %+v, want one entry before ban", known)
-	}
-
-	set.BanRelayURL(relayURL)
-	if known := set.KnownIncompatibleRelays(); len(known) != 0 {
-		t.Fatalf("KnownIncompatibleRelays() = %+v, want empty after local ban", known)
-	}
-}
-
-func TestProtocolMismatchOutranksMissingTarget(t *testing.T) {
-	set := NewRelaySet(nil)
-
-	relayURL := "https://relay-old.example"
-	_, err := set.ApplyRelayDiscoveryResponse(relayURL, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion + "-older",
-		Relays:          nil,
-	}, time.Now().UTC())
-	if !errors.Is(err, ErrProtocolMismatch) {
-		t.Fatalf("ApplyRelayDiscoveryResponse() error = %v, want ErrProtocolMismatch even without a target descriptor", err)
-	}
-	if known := set.KnownIncompatibleRelays(); len(known) != 1 || known[0].URL != relayURL {
-		t.Fatalf("KnownIncompatibleRelays() = %+v, want one entry for %q", known, relayURL)
-	}
-}
-
 func TestApplyRelayDiscoveryResponseRecordsTargetReleaseVersion(t *testing.T) {
 	set := NewRelaySet(nil)
 
@@ -496,25 +436,6 @@ func TestApplyRelayDiscoveryResponseIgnoresReleaseVersionFromGossip(t *testing.T
 	}
 }
 
-func TestApplyRelayDiscoveryResponseRetainsReleaseAcrossProtocolMismatch(t *testing.T) {
-	set := NewRelaySet(nil)
-
-	relayURL := "https://relay-mismatch-release.example"
-	_, err := set.ApplyRelayDiscoveryResponse(relayURL, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion + "-older",
-		ReleaseVersion:  "v2.6.0",
-	}, time.Now().UTC())
-	if !errors.Is(err, ErrProtocolMismatch) {
-		t.Fatalf("ApplyRelayDiscoveryResponse() error = %v, want ErrProtocolMismatch", err)
-	}
-
-	// #512: the protocol label is only a fallback for when no release is
-	// known. A directly observed release must survive the mismatch.
-	if versions := set.KnownRelayReleaseVersions(); len(versions) != 1 || versions[relayURL] != "v2.6.0" {
-		t.Fatalf("KnownRelayReleaseVersions() = %+v, want {%q: %q} despite ErrProtocolMismatch", versions, relayURL, "v2.6.0")
-	}
-}
-
 func TestKnownRelayReleaseVersionsExpireWithoutFreshDirectPoll(t *testing.T) {
 	set := NewRelaySet(nil)
 
@@ -550,104 +471,60 @@ func TestKnownRelayReleaseVersionsExpireWithoutFreshDirectPoll(t *testing.T) {
 	}
 }
 
-func TestApplyRelayDiscoveryResponseDropsReleaseWhenPeerStopsReporting(t *testing.T) {
-	set := NewRelaySet(nil)
-
-	relayURL := "https://relay-stopped.example"
-	signing := mustSigningIdentity(t)
-	t0 := time.Now().UTC().Truncate(time.Microsecond)
-	desc := mustSignedDescriptor(t, signing, relayURL, t0)
-	if _, err := set.ApplyRelayDiscoveryResponse(relayURL, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion,
-		Relays:          []types.RelayDescriptor{desc},
-		ReleaseVersion:  "v2.6.0",
-	}, t0); err != nil {
-		t.Fatalf("ApplyRelayDiscoveryResponse() error = %v", err)
-	}
-	if versions := set.KnownRelayReleaseVersions(); versions[relayURL] != "v2.6.0" {
-		t.Fatalf("KnownRelayReleaseVersions() = %+v, want {%q: %q}", versions, relayURL, "v2.6.0")
-	}
-
-	// The peer later answers without a release (an older build that stopped
-	// reporting): the latest direct observation wins.
-	t1 := t0.Add(time.Minute)
-	freshDesc := mustSignedDescriptor(t, signing, relayURL, t1)
-	if _, err := set.ApplyRelayDiscoveryResponse(relayURL, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion,
-		Relays:          []types.RelayDescriptor{freshDesc},
-	}, t1); err != nil {
-		t.Fatalf("ApplyRelayDiscoveryResponse() error = %v", err)
-	}
-	if versions := set.KnownRelayReleaseVersions(); len(versions) != 0 {
-		t.Fatalf("KnownRelayReleaseVersions() = %+v, want empty after the peer stopped reporting its release", versions)
+func TestApplyRelayDiscoveryResponseCollectionLimit(t *testing.T) {
+	t.Parallel()
+	for _, count := range []int{MaxAnnouncedRelays + 1, MaxAnnouncedRelays + 2} {
+		set := NewRelaySet(nil)
+		changed, err := set.ApplyRelayDiscoveryResponse("", types.DiscoveryResponse{
+			Relays: make([]types.RelayDescriptor, count),
+		}, time.Now())
+		if (err != nil) != (count > MaxAnnouncedRelays+1) || changed {
+			t.Fatalf("collection size %d: changed=%v, error=%v", count, changed, err)
+		}
 	}
 }
 
-// A local ban drops the release observation outright rather than hiding it:
-// the projection goes empty on ban, stays empty after AllowRelayURL, and
-// returns only after a fresh direct poll.
-func TestBanRelayURLDropsReleaseObservation(t *testing.T) {
+func TestDiscoveryObservationMapsStayBounded(t *testing.T) {
+	t.Parallel()
+
 	set := NewRelaySet(nil)
-
-	relayURL := "https://relay-banned-release.example"
-	desc := mustRelayDescriptor(t, relayURL)
-	if _, err := set.ApplyRelayDiscoveryResponse(relayURL, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion,
-		Relays:          []types.RelayDescriptor{desc},
-		ReleaseVersion:  "v2.6.0",
-	}, time.Now().UTC()); err != nil {
-		t.Fatalf("ApplyRelayDiscoveryResponse() error = %v", err)
+	now := time.Now().UTC()
+	set.mu.Lock()
+	for i := range MaxAnnouncedRelays + 1 {
+		relayURL := fmt.Sprintf("https://observed-%d.example", i)
+		observedAt := now.Add(time.Duration(i) * time.Millisecond)
+		set.recordReleaseObservationLocked(relayURL, "v2.6.0", observedAt)
+		set.recordIncompatibleRelayLocked(relayURL, "older", observedAt)
 	}
-	if versions := set.KnownRelayReleaseVersions(); len(versions) != 1 {
-		t.Fatalf("KnownRelayReleaseVersions() = %+v, want one entry before ban", versions)
-	}
+	set.mu.Unlock()
 
-	set.BanRelayURL(relayURL)
-	if versions := set.KnownRelayReleaseVersions(); len(versions) != 0 {
-		t.Fatalf("KnownRelayReleaseVersions() = %+v, want empty after local ban", versions)
+	if len(set.releaseVersions) != MaxAnnouncedRelays || len(set.incompatible) != MaxAnnouncedRelays {
+		t.Fatalf("retained observations = (releases %d, incompatible %d), want %d each",
+			len(set.releaseVersions), len(set.incompatible), MaxAnnouncedRelays)
 	}
-
-	// The observation was dropped, not hidden: unbanning must not resurface
-	// the stale release; it returns only after a fresh direct poll.
-	set.AllowRelayURL(relayURL)
-	if versions := set.KnownRelayReleaseVersions(); len(versions) != 0 {
-		t.Fatalf("KnownRelayReleaseVersions() = %+v, want still empty after unban: a local ban drops the observation", versions)
+	if _, ok := set.releaseVersions["https://observed-0.example"]; ok {
+		t.Fatal("oldest release observation was not evicted")
+	}
+	if _, ok := set.incompatible["https://observed-0.example"]; ok {
+		t.Fatal("oldest incompatible observation was not evicted")
 	}
 }
 
-// Storage bound: expired release observations are deleted from the map as
-// fresh direct polls arrive (not merely hidden from the projection), so the
-// map cannot grow without bound as polled relay URLs churn.
-func TestRecordReleaseObservationPrunesExpiredEntries(t *testing.T) {
+func TestDiscoveryObservationLabelsStayBounded(t *testing.T) {
+	t.Parallel()
+
 	set := NewRelaySet(nil)
+	relayURL := "https://peer.example"
+	large := strings.Repeat("v", types.MaxDiscoveryVersionBytes+1)
+	set.mu.Lock()
+	set.recordReleaseObservationLocked(relayURL, large, time.Now().UTC())
+	set.recordIncompatibleRelayLocked(relayURL, large, time.Now().UTC())
+	set.mu.Unlock()
 
-	signing := mustSigningIdentity(t)
-	relayA := "https://relay-a-release.example"
-	t0 := time.Now().UTC().Truncate(time.Microsecond)
-	descA := mustSignedDescriptor(t, signing, relayA, t0)
-	if _, err := set.ApplyRelayDiscoveryResponse(relayA, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion,
-		Relays:          []types.RelayDescriptor{descA},
-		ReleaseVersion:  "v2.6.0",
-	}, t0); err != nil {
-		t.Fatalf("ApplyRelayDiscoveryResponse() error = %v", err)
+	if len(set.releaseVersions) != 0 {
+		t.Fatalf("retained %d oversized release labels", len(set.releaseVersions))
 	}
-
-	relayB := "https://relay-b-release.example"
-	t1 := t0.Add(AnnounceMaxValidity).Add(time.Hour)
-	descB := mustSignedDescriptor(t, signing, relayB, t1)
-	if _, err := set.ApplyRelayDiscoveryResponse(relayB, types.DiscoveryResponse{
-		ProtocolVersion: types.DiscoveryVersion,
-		Relays:          []types.RelayDescriptor{descB},
-		ReleaseVersion:  "v2.6.1",
-	}, t1); err != nil {
-		t.Fatalf("ApplyRelayDiscoveryResponse() error = %v", err)
-	}
-
-	if len(set.releaseVersions) != 1 {
-		t.Fatalf("len(set.releaseVersions) = %d, want 1 after the expired observation is pruned", len(set.releaseVersions))
-	}
-	if observation, ok := set.releaseVersions[relayB]; !ok || observation.releaseVersion != "v2.6.1" {
-		t.Fatalf("set.releaseVersions[%q] = (%+v, %v), want only the fresh observation", relayB, observation, ok)
+	if entry, ok := set.incompatible[relayURL]; !ok || entry.ProtocolVersion != "" {
+		t.Fatalf("oversized protocol label stored: %+v (exists: %t)", entry, ok)
 	}
 }

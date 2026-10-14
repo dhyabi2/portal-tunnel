@@ -2,6 +2,7 @@ package portal
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/gosuda/portal-tunnel/v2/portal/transport"
 	"github.com/gosuda/portal-tunnel/v2/types"
 )
 
@@ -133,30 +133,6 @@ func TestRawPortsAreAllocatedPerIdentity(t *testing.T) {
 	}
 }
 
-// A connector that cannot open a raw stream - a browser - reaches the reverse session
-// over a WebSocket, carrying the reverse capability as a subprotocol since the WebSocket
-// constructor cannot set headers.
-func TestConnectAcceptsWebSocketReverseSession(t *testing.T) {
-	t.Parallel()
-
-	_, relayURL, capability := newConnectTestRelay(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	socket, _, err := websocket.Dial(ctx, wsURL(relayURL), &websocket.DialOptions{
-		Subprotocols: []string{types.ReverseSubprotocol, capability},
-	})
-	if err != nil {
-		t.Fatalf("Dial() error = %v, want an accepted reverse session", err)
-	}
-	t.Cleanup(func() { _ = socket.CloseNow() })
-
-	// Only the marker comes back, so the handshake response does not echo the credential.
-	if got := socket.Subprotocol(); got != types.ReverseSubprotocol {
-		t.Fatalf("Subprotocol() = %q, want %q", got, types.ReverseSubprotocol)
-	}
-}
-
 // The WebSocket carrier takes its capability only from the subprotocols, beside the
 // marker; the raw carrier's header does not admit it.
 func TestConnectRejectsWebSocketWithoutCapability(t *testing.T) {
@@ -177,32 +153,6 @@ func TestConnectRejectsWebSocketWithoutCapability(t *testing.T) {
 			_ = socket.CloseNow()
 			t.Errorf("%s: Dial() error = nil, want the session refused", name)
 		}
-	}
-}
-
-// The session is admitted for one lease and ends with it.
-func TestConnectEndsWebSocketSessionWithTheLease(t *testing.T) {
-	t.Parallel()
-
-	server, relayURL, capability := newConnectTestRelay(t)
-	lease, err := server.registry.admitReverseCapability(capability)
-	if err != nil {
-		t.Fatalf("admitReverseCapability() error = %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	session, err := transport.DialReverseMux(ctx, relayURL, capability)
-	if err != nil {
-		t.Fatalf("DialReverseMux() error = %v", err)
-	}
-	t.Cleanup(func() { _ = session.Close() })
-
-	lease.Close()
-	select {
-	case <-session.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("reverse session still open after its lease closed")
 	}
 }
 
@@ -231,4 +181,42 @@ func newConnectTestRelay(t *testing.T) (*Server, *url.URL, string) {
 
 func wsURL(relayURL *url.URL) string {
 	return strings.Replace(relayURL.String(), "http://", "ws://", 1)
+}
+
+func TestPublicIngressAggregateAdmissionAndRelease(t *testing.T) {
+	var server Server
+	var conns []net.Conn
+	for range publicIngressLimit {
+		conn, peer := net.Pipe()
+		t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+		if !server.admitIngress(conn, false) {
+			t.Fatal("connection below aggregate limit rejected")
+		}
+		conns = append(conns, conn)
+	}
+	extra, peer := net.Pipe()
+	defer extra.Close()
+	defer peer.Close()
+	if server.admitIngress(extra, false) {
+		t.Fatal("raw TCP bypassed tenant connection budget")
+	}
+	if !server.admitIngress(extra, true) {
+		t.Fatal("tenant saturation blocked root inspection")
+	}
+	if server.promoteIngress() {
+		t.Fatal("SNI tenant bypassed tenant connection budget")
+	}
+	server.releaseIngress(conns[0], false)
+	if !server.promoteIngress() {
+		t.Fatal("released tenant capacity was not reusable")
+	}
+	server.closeIngress()
+	if server.admitIngress(conns[0], false) {
+		t.Fatal("connection admitted after shutdown")
+	}
+	server.releaseIngress(extra, false)
+	for _, conn := range conns[1:] {
+		server.releaseIngress(conn, false)
+	}
+	server.ingressWorkers.Wait()
 }

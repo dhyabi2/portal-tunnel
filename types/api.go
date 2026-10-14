@@ -92,10 +92,11 @@ type RegisterChallengeResponse struct {
 // ReverseEndpoint authorizes one class of operation: opening reverse streams.
 // Capability is opaque to SDK callers and cannot mutate the owning lease.
 type ReverseEndpoint struct {
-	URL        string    `json:"url"`
-	Capability string    `json:"capability"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	Overlay    bool      `json:"overlay,omitempty"`
+	URL        string           `json:"url"`
+	Capability string           `json:"capability"`
+	ExpiresAt  time.Time        `json:"expires_at"`
+	Overlay    bool             `json:"overlay,omitempty"`
+	Gateway    *RelayDescriptor `json:"gateway,omitempty"`
 }
 
 type RegisterResponse struct {
@@ -110,6 +111,17 @@ type RegisterResponse struct {
 	TCPAddr           string          `json:"tcp_addr,omitempty"`
 	TCPEnabled        bool            `json:"tcp_enabled,omitempty"`
 }
+
+// MaxDiscoveryResponseBytes is the decoded-byte budget for both discovery
+// readers and producers.
+const MaxDiscoveryResponseBytes int64 = 1 << 20
+
+// MaxDiscoveryEntries bounds retained relay peers and each metadata collection.
+// The relays wire field permits one additional descriptor for the serving relay.
+const MaxDiscoveryEntries = 1024
+
+// MaxDiscoveryVersionBytes bounds untrusted protocol and release labels.
+const MaxDiscoveryVersionBytes = 128
 
 type DiscoveryResponse struct {
 	ProtocolVersion    string                   `json:"protocol_version"`
