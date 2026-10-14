@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"runtime"
 	"strings"
@@ -549,6 +550,13 @@ func (l *listener) runStaticCache(ctx context.Context) {
 		}
 		if err := syncer.Sync(ctx, l.api.httpClient(), lease.accessToken); err != nil && ctx.Err() == nil {
 			log.Warn().Err(err).Str("relay_url", l.api.relayURL.String()).Msg("static cache population skipped; origin tunnel remains available")
+			var apiErr *types.APIRequestError
+			if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusServiceUnavailable || apiErr.IsRateLimited()) {
+				delay := cmp.Or(apiErr.RetryAfter, time.Second)
+				if !utils.SleepOrDone(ctx, delay) {
+					return
+				}
+			}
 		}
 	}
 }
