@@ -67,17 +67,24 @@ func (c *Manager) Handle(w http.ResponseWriter, req *http.Request, leaseID strin
 	if req.Method == http.MethodPut {
 		// Includes multipart framing and manifest bytes, with a fixed bound.
 		req.Body = &idleUploadBody{
-			ReadCloser:   http.MaxBytesReader(w, req.Body, c.limits.MaxExposureBytes+2*types.StaticCacheManifestLimit),
-			controller:   controller,
-			maxDeadline:  deadline,
-			idleTimeout:  c.uploadIdleTimeout,
+			ReadCloser:  http.MaxBytesReader(w, req.Body, c.limits.MaxExposureBytes+2*types.StaticCacheManifestLimit),
+			controller:  controller,
+			maxDeadline: deadline,
+			idleTimeout: c.uploadIdleTimeout,
 		}
 	} else {
 		_ = controller.SetReadDeadline(deadline)
 	}
-	defer controller.SetReadDeadline(time.Time{})
 	var manifest types.StaticCacheManifest
 	var err error
+	defer func() {
+		// Clear the deadline only when the request body was consumed. After a
+		// failed read the expired deadline fails the leftover-body drain fast
+		// so the response is flushed and the connection closes.
+		if err == nil {
+			_ = controller.SetReadDeadline(time.Time{})
+		}
+	}()
 	var parts *multipart.Reader
 	var manifestReader io.Reader
 	if req.Method == http.MethodPut {
@@ -204,7 +211,6 @@ func (c *Manager) Handle(w http.ResponseWriter, req *http.Request, leaseID strin
 	c.collect(time.Now())
 	utils.WriteAPIData(w, http.StatusOK, status)
 }
-
 
 // idleUploadBody applies an inactivity deadline to each blocking read.
 // The two-minute absolute deadline still caps uploads that trickle bytes.

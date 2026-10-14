@@ -15,15 +15,15 @@ import (
 // Manager owns both staging and published bytes. Registry operations only
 // mutate metadata; disk work never holds the registry's lock.
 type Manager struct {
-	mu         sync.Mutex
-	cfg        Config
-	dir        string
-	limits     types.StaticCacheLimits
-	leases     map[string]leaseState
-	entries    map[string]*cachedSite
-	retired    []*cachedSite
-	used       int64
-	snapshots  int
+	mu                sync.Mutex
+	cfg               Config
+	dir               string
+	limits            types.StaticCacheLimits
+	leases            map[string]leaseState
+	entries           map[string]*cachedSite
+	retired           []*cachedSite
+	used              int64
+	snapshots         int
 	uploadActive      map[types.ServiceIdentityKey]struct{}
 	uploadQueue       []*uploadWaiter
 	uploadIdleTimeout time.Duration

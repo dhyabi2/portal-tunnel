@@ -278,7 +278,7 @@ func TestTransientCacheAdmissionFailureDoesNotDeletePublishedSnapshot(t *testing
 			syncer := &Syncer{
 				relayURL: *base,
 				snapshot: &sourceSnapshot{root: root, manifest: manifest},
-				limits: types.StaticCacheLimits{MaxExposureBytes: 1024, MaxObjectSize: 512},
+				limits:   types.StaticCacheLimits{MaxExposureBytes: 1024, MaxObjectSize: 512},
 			}
 			err = syncer.Sync(context.Background(), server.Client(), "lease-token")
 			var apiErr *types.APIRequestError

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gosuda/portal-tunnel/v2/types"
@@ -573,98 +574,100 @@ func TestDetachOwnerSuppressesCacheRouting(t *testing.T) {
 }
 
 func TestUploadAdmissionFairlyServesWaitingOwners(t *testing.T) {
-	c := testManager(t, 64)
-	type heldUpload struct {
-		started chan struct{}
-		resume  chan struct{}
-		result  <-chan int
-	}
-	start := func(lease Lease) heldUpload {
-		started := make(chan struct{})
-		resume := make(chan struct{})
-		result := make(chan int, 1)
-		req := testRequest(t, http.MethodPut, "site")
-		req.Body = &gatedBody{ReadCloser: req.Body, started: started, resume: resume}
-		go func() {
-			w := httptest.NewRecorder()
-			c.Handle(w, req, lease.ID, c.Generation(lease.ID))
-			result <- w.Code
-		}()
-		return heldUpload{started: started, resume: resume, result: result}
-	}
-	release := func(ch chan struct{}) {
+	synctest.Test(t, func(t *testing.T) {
+		c := testManager(t, 64)
+		type heldUpload struct {
+			started chan struct{}
+			resume  chan struct{}
+			result  <-chan int
+		}
+		start := func(lease Lease) heldUpload {
+			started := make(chan struct{})
+			resume := make(chan struct{})
+			result := make(chan int, 1)
+			req := testRequest(t, http.MethodPut, "site")
+			req.Body = &gatedBody{ReadCloser: req.Body, started: started, resume: resume}
+			go func() {
+				w := httptest.NewRecorder()
+				c.Handle(w, req, lease.ID, c.Generation(lease.ID))
+				result <- w.Code
+			}()
+			return heldUpload{started: started, resume: resume, result: result}
+		}
+		release := func(ch chan struct{}) {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+		await := func(ch <-chan struct{}) {
+			t.Helper()
+			select {
+			case <-ch:
+			case <-time.After(3 * time.Second):
+				t.Fatal("upload was not admitted")
+			}
+		}
+		waitQueue := func(count int) {
+			t.Helper()
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				c.mu.Lock()
+				queued := len(c.uploadQueue)
+				c.mu.Unlock()
+				if queued == count {
+					return
+				}
+				synctest.Sleep(time.Millisecond)
+			}
+			t.Fatalf("waiting upload count never reached %d", count)
+		}
+
+		firstLease := testLease(c, "first")
+		first := start(firstLease)
+		defer release(first.resume)
+		await(first.started)
+		second := start(testLease(c, "second"))
+		defer release(second.resume)
+		await(second.started)
+		third := start(testLease(c, "third"))
+		defer release(third.resume)
+		waitQueue(1)
+		fourth := start(testLease(c, "fourth"))
+		defer release(fourth.resume)
+		waitQueue(2)
+
+		// A second request from one owner cannot consume the remaining slot
+		// or jump ahead of the waiting owners.
+		rejected := httptest.NewRecorder()
+		c.Handle(rejected, testRequest(t, http.MethodPut, "site"), firstLease.ID, c.Generation(firstLease.ID))
+		if rejected.Code != http.StatusServiceUnavailable {
+			t.Fatalf("duplicate owner admitted: %d", rejected.Code)
+		}
+
+		release(second.resume)
+		await(third.started)
 		select {
-		case <-ch:
+		case <-fourth.started:
+			t.Fatal("later owner bypassed the FIFO queue")
 		default:
-			close(ch)
 		}
-	}
-	await := func(ch <-chan struct{}) {
-		t.Helper()
-		select {
-		case <-ch:
-		case <-time.After(3 * time.Second):
-			t.Fatal("upload was not admitted")
-		}
-	}
-	waitQueue := func(count int) {
-		t.Helper()
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			c.mu.Lock()
-			queued := len(c.uploadQueue)
-			c.mu.Unlock()
-			if queued == count {
-				return
+		release(third.resume)
+		await(fourth.started)
+		release(first.resume)
+		release(fourth.resume)
+		for _, upload := range []heldUpload{first, second, third, fourth} {
+			select {
+			case code := <-upload.result:
+				if code != http.StatusOK {
+					t.Fatalf("admitted upload failed: %d", code)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("admitted upload did not complete")
 			}
-			time.Sleep(time.Millisecond)
 		}
-		t.Fatalf("waiting upload count never reached %d", count)
-	}
-
-	firstLease := testLease(c, "first")
-	first := start(firstLease)
-	defer release(first.resume)
-	await(first.started)
-	second := start(testLease(c, "second"))
-	defer release(second.resume)
-	await(second.started)
-	third := start(testLease(c, "third"))
-	defer release(third.resume)
-	waitQueue(1)
-	fourth := start(testLease(c, "fourth"))
-	defer release(fourth.resume)
-	waitQueue(2)
-
-	// A second request from one owner cannot consume the remaining slot
-	// or jump ahead of the waiting owners.
-	rejected := httptest.NewRecorder()
-	c.Handle(rejected, testRequest(t, http.MethodPut, "site"), firstLease.ID, c.Generation(firstLease.ID))
-	if rejected.Code != http.StatusServiceUnavailable {
-		t.Fatalf("duplicate owner admitted: %d", rejected.Code)
-	}
-
-	release(second.resume)
-	await(third.started)
-	select {
-	case <-fourth.started:
-		t.Fatal("later owner bypassed the FIFO queue")
-	default:
-	}
-	release(third.resume)
-	await(fourth.started)
-	release(first.resume)
-	release(fourth.resume)
-	for _, upload := range []heldUpload{first, second, third, fourth} {
-		select {
-		case code := <-upload.result:
-			if code != http.StatusOK {
-				t.Fatalf("admitted upload failed: %d", code)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatal("admitted upload did not complete")
-		}
-	}
+	})
 }
 
 func TestStalledMultipartUploadReleasesAdmission(t *testing.T) {
