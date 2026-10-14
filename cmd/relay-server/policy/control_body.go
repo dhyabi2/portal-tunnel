@@ -17,20 +17,42 @@ const (
 	controlBodySourceLimit = 4
 )
 
-// controlBodyLimiter bounds live JSON control requests independently of the
+// ControlBodyLimiter bounds live control requests independently of the
 // refillable pre-auth request budget. Only active sources occupy map entries.
-type controlBodyLimiter struct {
+type ControlBodyLimiter struct {
 	mu      sync.Mutex
 	active  int
 	sources map[netip.Addr]int
 	timeout time.Duration
 }
 
-func newControlBodyLimiter(timeout time.Duration) *controlBodyLimiter {
-	return &controlBodyLimiter{sources: make(map[netip.Addr]int), timeout: timeout}
+// NewControlBodyLimiter creates one relay's shared active-body budget.
+func NewControlBodyLimiter() *ControlBodyLimiter {
+	return &ControlBodyLimiter{sources: make(map[netip.Addr]int), timeout: controlBodyReadTimeout}
 }
 
-func (l *controlBodyLimiter) acquire(source netip.Addr) bool {
+// Handler applies control-body protection and CORS to an owned control handler.
+// Share one limiter across the relay's protocol and application control routes.
+// Streaming application handlers should retain ownership of their own limits.
+func (l *ControlBodyLimiter) Handler(next http.Handler, ingress *Ingress) http.Handler {
+	control := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !utils.HandleAPICORS(w, r) {
+			next.ServeHTTP(w, r)
+		}
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A protocol handler may delegate to an application-owned control
+		// handler. The existing body wrapper means it is already protected.
+		_, protected := r.Body.(*controlBody)
+		if r.Body != nil && r.Body != http.NoBody && !protected {
+			l.serve(w, r, ingress.SourceAddr(r), control)
+			return
+		}
+		control.ServeHTTP(w, r)
+	})
+}
+
+func (l *ControlBodyLimiter) acquire(source netip.Addr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.active >= controlBodyGlobalLimit || l.sources[source] >= controlBodySourceLimit {
@@ -41,7 +63,7 @@ func (l *controlBodyLimiter) acquire(source netip.Addr) bool {
 	return true
 }
 
-func (l *controlBodyLimiter) release(source netip.Addr) {
+func (l *ControlBodyLimiter) release(source netip.Addr) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.active--
@@ -82,7 +104,7 @@ func (b *controlBody) Read(p []byte) (int, error) {
 // serve bounds ordinary request bodies. Cache POST/PUT handlers own their
 // read deadlines and concurrency, but still need unread-body cleanup when
 // authentication or admission rejects a request before consuming it.
-func (l *controlBodyLimiter) serve(w http.ResponseWriter, r *http.Request, source netip.Addr, next http.Handler) {
+func (l *ControlBodyLimiter) serve(w http.ResponseWriter, r *http.Request, source netip.Addr, next http.Handler) {
 	controller := http.NewResponseController(w)
 	cacheBody := r.URL.Path == types.PathSDKCache && (r.Method == http.MethodPost || r.Method == http.MethodPut)
 	if !cacheBody {

@@ -28,6 +28,7 @@ func TestRelayClosesUnreadControlBodies(t *testing.T) {
 		{http.MethodGet, types.PathSDKConnect, http.StatusBadRequest},
 		{http.MethodOptions, types.PathSDKRegister, http.StatusNoContent},
 		{http.MethodPost, types.PathV1Sign, http.StatusForbidden},
+		{http.MethodPost, types.PathPolicy, http.StatusUnauthorized},
 		{http.MethodPost, types.PathSDKCache, http.StatusForbidden},
 		{http.MethodPut, types.PathSDKCache, http.StatusForbidden},
 	} {

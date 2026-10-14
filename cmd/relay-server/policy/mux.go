@@ -4,7 +4,9 @@ import (
 	"math"
 	"net/http"
 	"net/netip"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gosuda/portal-tunnel/v2/portal"
@@ -20,7 +22,9 @@ const accessPublishAttempts = 8
 // handler (admin API, x402, application routes). A nil ingress resolves the
 // socket peer, a nil admission disables pre-auth budgeting, and a nil access
 // keeps every identity routable; the relay binary always supplies real ones.
-func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *SourceLimiter, access *Access, preAuth types.PreAuthConfig) http.Handler {
+// Caller-provided fallback handlers own their body limits and CORS handling.
+// Share controlBodies with application control handlers that need protection.
+func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *SourceLimiter, access *Access, preAuth types.PreAuthConfig, controlBodies *ControlBodyLimiter) http.Handler {
 	if ingress == nil {
 		ingress = &Ingress{}
 	}
@@ -29,7 +33,7 @@ func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *S
 		// everything else, matching the standalone Serve(ctx, nil) shape.
 		root := http.NewServeMux()
 		root.HandleFunc("/{$}", s.HandleRoot)
-		fallback = root
+		fallback = controlBodies.Handler(root, ingress)
 	}
 	// A newer committed snapshot may reach Portal while this request is
 	// paused. Retry a bounded number of times when Portal rejects the older
@@ -81,8 +85,6 @@ func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *S
 		}
 	}
 
-	// Active body capacity is independent of the refillable request-rate budget.
-	controlBodies := newControlBodyLimiter(controlBodyReadTimeout)
 	mux := http.NewServeMux()
 	mux.HandleFunc(types.PathHealthz, func(w http.ResponseWriter, _ *http.Request) {
 		utils.WriteAPIData(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -141,18 +143,23 @@ func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *S
 	}))
 	mux.Handle("/", fallback)
 
-	control := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if utils.HandleAPICORS(w, r) {
+	control := controlBodies.Handler(mux, ingress)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Protect complete protocol namespaces, including wrong methods,
+		// unknown paths and redirects, without constraining caller-owned
+		// fallback routes. Canonicalize as ServeMux does before routing.
+		requestPath := path.Clean(r.URL.Path)
+		for _, prefix := range []string{types.PathSDKPrefix, types.PathDiscovery, types.PathV1Prefix} {
+			if requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/") {
+				control.ServeHTTP(w, r)
+				return
+			}
+		}
+		if requestPath == types.PathHealthz {
+			control.ServeHTTP(w, r)
 			return
 		}
 		mux.ServeHTTP(w, r)
-	})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Body != nil && r.Body != http.NoBody {
-			controlBodies.serve(w, r, ingress.SourceAddr(r), control)
-			return
-		}
-		control.ServeHTTP(w, r)
 	})
 }
 

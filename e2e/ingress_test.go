@@ -93,7 +93,7 @@ func TestConnectRejectsRoutingBannedIdentity(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	access := policy.NewAccess()
-	if err := server.Start(ctx, policy.Mux(server, nil, nil, nil, access, policy.DefaultPreAuthConfig())); err != nil {
+	if err := server.Start(ctx, policy.Mux(server, nil, nil, nil, access, policy.DefaultPreAuthConfig(), policy.NewControlBodyLimiter())); err != nil {
 		t.Fatalf("start portal server: %v", err)
 	}
 	transport := &http.Transport{DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "localhost"}}

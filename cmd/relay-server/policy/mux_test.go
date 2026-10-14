@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/gosuda/portal-tunnel/v2/types"
@@ -17,7 +18,7 @@ func TestMuxRejectsMethodBeforeAdmission(t *testing.T) {
 				ChallengeCost: 1,
 				RegisterCost:  1,
 				AnnounceCost:  1,
-			})
+			}, NewControlBodyLimiter())
 			req := httptest.NewRequest(http.MethodGet, path, nil)
 			req.RemoteAddr = "192.0.2.1:1234"
 			response := httptest.NewRecorder()
@@ -27,6 +28,28 @@ func TestMuxRejectsMethodBeforeAdmission(t *testing.T) {
 			}
 			if retry, _ := limiter.Allow(netip.MustParseAddr("192.0.2.1"), 1); retry != 0 {
 				t.Fatal("unsupported method consumed the pre-auth budget")
+			}
+		})
+	}
+}
+
+func TestMuxLeavesFallbackBodyLimitsToOwner(t *testing.T) {
+	for _, requestPath := range []string{"/upload", "/api/upload"} {
+		t.Run(requestPath, func(t *testing.T) {
+			fallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Body == nil {
+					t.Fatal("fallback body was removed")
+				}
+				w.WriteHeader(http.StatusCreated)
+			})
+			handler := Mux(nil, fallback, nil, nil, nil, types.PreAuthConfig{}, NewControlBodyLimiter())
+			request := httptest.NewRequest(http.MethodPost, requestPath, strings.NewReader("upload"))
+			// A recorder cannot enforce body deadlines. The fallback must still
+			// receive the request rather than inherit control-plane restrictions.
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("fallback status = %d, want 201", response.Code)
 			}
 		})
 	}

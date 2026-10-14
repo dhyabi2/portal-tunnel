@@ -31,7 +31,7 @@ const marker = "portal-e2e-ok"
 // relay admission and ingress resolution. The zero dependencies here mean no
 // proxy trust, the default pre-auth budget, and automatic approval.
 func relayHandler(server *portal.Server, fallback http.Handler) http.Handler {
-	return policy.Mux(server, fallback, nil, nil, nil, policy.DefaultPreAuthConfig())
+	return policy.Mux(server, fallback, nil, nil, nil, policy.DefaultPreAuthConfig(), policy.NewControlBodyLimiter())
 }
 
 type harness struct {

@@ -17,7 +17,7 @@ import (
 )
 
 func TestControlBodyLimiterBoundsActiveSourcesAndGlobalWork(t *testing.T) {
-	limiter := newControlBodyLimiter(time.Second)
+	limiter := NewControlBodyLimiter()
 	one := netip.MustParseAddr("192.0.2.1")
 	for range controlBodySourceLimit {
 		if !limiter.acquire(one) {
@@ -55,7 +55,7 @@ func TestControlBodyLimiterBoundsActiveSourcesAndGlobalWork(t *testing.T) {
 }
 
 func TestControlBodyLimiterRejectsWithoutReadingBody(t *testing.T) {
-	limiter := newControlBodyLimiter(time.Second)
+	limiter := NewControlBodyLimiter()
 	source := netip.MustParseAddr("127.0.0.1")
 	for range controlBodySourceLimit {
 		if !limiter.acquire(source) {
@@ -110,7 +110,8 @@ func TestControlBodyLimiterRejectsWithoutReadingBody(t *testing.T) {
 }
 
 func TestControlBodyLimiterStopsTrickledJSONAtDeadline(t *testing.T) {
-	limiter := newControlBodyLimiter(120 * time.Millisecond)
+	limiter := NewControlBodyLimiter()
+	limiter.timeout = 120 * time.Millisecond
 	source := netip.MustParseAddr("127.0.0.1")
 	readResult := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +177,7 @@ func TestControlBodyLimiterStopsTrickledJSONAtDeadline(t *testing.T) {
 }
 
 func TestControlBodyLimiterFailsClosedWithoutBodyControls(t *testing.T) {
-	limiter := newControlBodyLimiter(time.Second)
+	limiter := NewControlBodyLimiter()
 	req := httptest.NewRequest(http.MethodPost, types.PathSDKRegister, strings.NewReader("{}"))
 	w := httptest.NewRecorder() // Does not support ResponseController body controls.
 	limiter.serve(w, req, netip.MustParseAddr("192.0.2.1"), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -191,7 +192,7 @@ func TestControlBodyLimiterFailsClosedWithoutBodyControls(t *testing.T) {
 }
 
 func TestControlBodyLimiterKeepsConnectionAfterCompleteBody(t *testing.T) {
-	limiter := newControlBodyLimiter(time.Second)
+	limiter := NewControlBodyLimiter()
 	source := netip.MustParseAddr("127.0.0.1")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limiter.serve(w, r, source, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
