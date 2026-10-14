@@ -145,7 +145,7 @@ func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, so
 				continue
 			}
 			votedAt := nextLastVoteAt[candidate]
-			if !found || votedAt < oldestAt || (votedAt == oldestAt && candidate < oldest) {
+			if !found || olderVote(candidate, votedAt, oldest, oldestAt) {
 				oldest, oldestAt, found = candidate, votedAt, true
 			}
 		}
@@ -177,6 +177,16 @@ func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, so
 	}
 	s.state = nextState
 	return s.summarize(hostname, votes, hash), minted, nil
+}
+
+// olderVote reports whether the candidate vote is older than the tracked
+// oldest, breaking equal timestamps on the identity so eviction is
+// deterministic.
+func olderVote(identity string, votedAt int64, oldest string, oldestAt int64) bool {
+	if votedAt < oldestAt {
+		return true
+	}
+	return votedAt == oldestAt && identity < oldest
 }
 
 func (s *ReputationStore) Summaries(viewerHash string, leases []types.PolicyLease) []ReputationSummary {
