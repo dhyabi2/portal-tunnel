@@ -1,16 +1,13 @@
 package cache
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -673,47 +670,6 @@ func TestUploadAdmissionIsolatesServiceIdentities(t *testing.T) {
 	c.Handle(w, testRequest(t, http.MethodPut, "retry"), other.ID, c.Generation(other.ID))
 	if w.Code != http.StatusOK {
 		t.Fatalf("failed upload retained admission: %d", w.Code)
-	}
-}
-
-func TestStalledMultipartUploadReleasesAdmission(t *testing.T) {
-	c := testManager(t, 64)
-	lease := testLease(c, "site")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.Handle(w, r, lease.ID, c.Generation(lease.ID))
-	}))
-	defer server.Close()
-	original := testRequest(t, http.MethodPut, "site")
-	body, err := io.ReadAll(original.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn, err := net.Dial("tcp", server.Listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if _, err := fmt.Fprintf(conn, "PUT / HTTP/1.1\r\nHost: localhost\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n", original.Header.Get("Content-Type"), len(body)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.Write(body[:8]); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn.SetReadDeadline(time.Now().Add(uploadIdleTimeout + 5*time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPut})
-	if err != nil {
-		t.Fatalf("stalled upload did not receive an HTTP response: %v", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("stalled upload = %d, want 400", response.StatusCode)
-	}
-	w := httptest.NewRecorder()
-	c.Handle(w, testRequest(t, http.MethodPut, "retry"), lease.ID, c.Generation(lease.ID))
-	if w.Code != http.StatusOK {
-		t.Fatalf("stalled upload retained admission: %d", w.Code)
 	}
 }
 

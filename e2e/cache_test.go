@@ -1,11 +1,16 @@
 package e2e_test
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,8 +27,102 @@ import (
 	"github.com/gosuda/portal-tunnel/v2/portal/cache"
 	"github.com/gosuda/portal-tunnel/v2/portal/identity"
 	"github.com/gosuda/portal-tunnel/v2/sdk"
+	"github.com/gosuda/portal-tunnel/v2/types"
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
+
+func TestStalledMultipartUploadReleasesAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stateDir := t.TempDir()
+	base, _ := url.Parse("https://127.0.0.1:" + strconv.Itoa(harnessPort(t, "127.0.0.1")))
+	relay, err := portal.NewServer(portal.ServerConfig{
+		PortalURL: base.String(), StateDir: stateDir, SNIListenAddr: base.Host,
+		Cache: cache.Config{Enabled: true, MaxBytes: 1024, MaxTTL: time.Minute},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.Start(ctx, relayHandler(relay, nil)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stopRelay(t, relay) })
+	waitForRelayCertificateMaterial(t, stateDir)
+	client := relayControlClient(t, stateDir)
+	id, err := identity.Generate("stalled-cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var challenge types.RegisterChallengeResponse
+	if err := utils.HTTPDoAPIPath(ctx, client, base, http.MethodPost, types.PathSDKRegisterChallenge,
+		types.RegisterChallengeRequest{Identity: id, Cache: true, TTL: 60}, nil, &challenge); err != nil {
+		t.Fatal(err)
+	}
+	signature, err := identity.NewLocalAuthority(id).SignEthereumPersonalMessage(challenge.SIWEMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lease types.RegisterResponse
+	if err := utils.HTTPDoAPIPath(ctx, client, base, http.MethodPost, types.PathSDKRegister,
+		types.RegisterRequest{ChallengeID: challenge.ChallengeID, SIWEMessage: challenge.SIWEMessage, SIWESignature: signature}, nil, &lease); err != nil {
+		t.Fatal(err)
+	}
+	const content = "site"
+	digest := sha256.Sum256([]byte(content))
+	manifest := fmt.Sprintf(`{"index":"index.html","files":[{"path":"index.html","size":4,"sha256":"%x"}]}`, digest)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, field := range []struct{ name, value string }{{"manifest", manifest}, {"object", content}} {
+		part, err := writer.CreateFormField(field.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(part, field.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", base.Host,
+		client.Transport.(*http.Transport).TLSClientConfig.Clone())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(conn, "PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n%s: %s\r\n\r\n",
+		types.PathSDKCache, base.Host, writer.FormDataContentType(), body.Len(), types.HeaderAccessToken, lease.AccessToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(body.Bytes()[:8]); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPut})
+	if err != nil {
+		t.Fatalf("stalled upload did not receive an HTTP response: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("stalled upload = %d, want 400", response.StatusCode)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, base.String()+types.PathSDKCache, bytes.NewReader(body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.Header.Set(types.HeaderAccessToken, lease.AccessToken)
+	response, err = client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("upload after timeout = %d, want 200", response.StatusCode)
+	}
+}
 
 func TestStaticCacheOffloadAndOfflineTLS(t *testing.T) {
 	const offlineTTL = time.Second
