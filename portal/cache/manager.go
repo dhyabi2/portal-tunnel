@@ -24,7 +24,7 @@ type Manager struct {
 	retired    []*cachedSite
 	used       int64
 	snapshots  int
-	population chan struct{}
+	uploads    map[types.ServiceIdentityKey]struct{}
 	checks     chan struct{}
 	generation uint64
 }
@@ -79,8 +79,8 @@ func New(cfg Config, dir string) (*Manager, error) {
 		cfg: cfg, dir: dir,
 		limits: types.StaticCacheLimits{MaxExposureBytes: int64(exposureBytes), MaxObjectSize: int64(min(10<<20, exposureBytes))},
 		leases: make(map[string]leaseState), entries: make(map[string]*cachedSite),
-		population: make(chan struct{}, 2),
-		checks:     make(chan struct{}, 2),
+		uploads: make(map[types.ServiceIdentityKey]struct{}),
+		checks:  make(chan struct{}, 2),
 	}, nil
 }
 
