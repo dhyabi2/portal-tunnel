@@ -565,9 +565,12 @@ func TestDetachOwnerSuppressesCacheRouting(t *testing.T) {
 // are never forwarded to an untrusted external endpoint via HTTP redirects.
 func TestStaticCacheDoesNotFollowRedirects(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte("site"), 0o600); err != nil {
+	content := []byte("site")
+	if err := os.WriteFile(filepath.Join(root, "index.html"), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	sum := sha256.Sum256(content)
+	hash := hex.EncodeToString(sum[:])
 
 	var foreignRequests atomic.Int32
 	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -598,7 +601,7 @@ func TestStaticCacheDoesNotFollowRedirects(t *testing.T) {
 			root: root,
 			manifest: types.StaticCacheManifest{
 				Index: "index.html",
-				Files: []types.StaticCacheFile{{Path: "index.html", Size: 4}},
+				Files: []types.StaticCacheFile{{Path: "index.html", Size: int64(len(content)), SHA256: hash}},
 			},
 		},
 	}
@@ -609,5 +612,90 @@ func TestStaticCacheDoesNotFollowRedirects(t *testing.T) {
 	}
 	if foreignRequests.Load() != 0 {
 		t.Fatalf("foreign server received %d requests, want 0 (redirect was followed)", foreignRequests.Load())
+	}
+}
+
+func TestStaticCacheRetriesTransientErrorsAndPreservesContent(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("site")
+	if err := os.WriteFile(filepath.Join(root, "index.html"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	hash := hex.EncodeToString(sum[:])
+
+	var deleteCalls atomic.Int32
+	var postStatus atomic.Int32
+	postStatus.Store(http.StatusTooManyRequests)
+
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodDelete:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodPost:
+			code := int(postStatus.Load())
+			if code == http.StatusOK {
+				utils.WriteAPIData(w, http.StatusOK, types.StaticCacheStatus{Present: true})
+				return
+			}
+			utils.WriteAPIError(w, code, types.APIErrorCodeRateLimited, "rate limited")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer relay.Close()
+
+	relayURL, err := url.Parse(relay.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source, err := NewSource(SourceConfig{Path: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := &sourceSnapshot{
+		root: root,
+		manifest: types.StaticCacheManifest{
+			Index: "index.html",
+			Files: []types.StaticCacheFile{{Path: "index.html", Size: int64(len(content)), SHA256: hash}},
+		},
+	}
+	source.mu.Lock()
+	source.snapshot = snap
+	source.mu.Unlock()
+
+	syncer := source.Subscribe(*relayURL, types.StaticCacheLimits{MaxExposureBytes: 1024, MaxObjectSize: 512})
+	defer syncer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if !syncer.Next(ctx) {
+		t.Fatal("Next() = false, want initial snapshot ready")
+	}
+
+	err = syncer.Sync(ctx, relay.Client(), "lease-token")
+	if err == nil {
+		t.Fatal("Sync() error = nil, want rate limited error")
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("DELETE called %d times on transient 429 error, want 0", deleteCalls.Load())
+	}
+	if syncer.snapshot != nil {
+		t.Fatal("syncer.snapshot was not cleared after transient failure")
+	}
+
+	if !syncer.Next(ctx) {
+		t.Fatal("Next() after transient failure = false, want same snapshot retried")
+	}
+
+	postStatus.Store(http.StatusOK)
+	if err := syncer.Sync(ctx, relay.Client(), "lease-token"); err != nil {
+		t.Fatalf("Sync() retry error = %v, want success", err)
+	}
+	if syncer.snapshot == nil {
+		t.Fatal("syncer.snapshot is nil after successful sync")
 	}
 }

@@ -76,7 +76,7 @@ func (s *Signer) ServeHTTP(w http.ResponseWriter, r *http.Request, leaseID strin
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxSignRequestBody)
-	defer r.Body.Close()
+	// The HTTP server owns body closure; connection deadlines belong to handlers.
 
 	var req signrpc.TranscriptSignRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

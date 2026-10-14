@@ -263,3 +263,31 @@ func TestNormalizeTargetAddrIPv6(t *testing.T) {
 		})
 	}
 }
+
+func TestIsLocalRelayHost(t *testing.T) {
+	for _, tc := range []struct {
+		host string
+		want bool
+	}{
+		{"", true},
+		{"localhost", true},
+		{"LOCALHOST", true},
+		{"sub.localhost", true},
+		{"my.app.localhost.", true},
+		{"relay.local", true},
+		{"app.relay.LOCAL.", true},
+		{"fe80::1%eth0", true},
+		{"127.0.0.1", true},
+		{"127.0.0.2", true},
+		{"::1", true},
+		{"relay.example.com", false},
+		{"192.0.2.1", false},
+		{"203.0.113.1", false},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			if got := IsLocalRelayHost(tc.host); got != tc.want {
+				t.Fatalf("IsLocalRelayHost(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+}

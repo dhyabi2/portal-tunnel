@@ -455,10 +455,13 @@ func IsLocalRelayHost(host string) bool {
 	case "", "localhost":
 		return true
 	}
+	if strings.Contains(host, "%") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.IsLoopback()
 	}
-	return strings.HasSuffix(host, ".localhost")
+	return false
 }
 
 func SleepOrDone(ctx context.Context, d time.Duration) bool {

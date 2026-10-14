@@ -67,8 +67,9 @@ func (s *Syncer) Next(ctx context.Context) bool {
 	return false
 }
 
-// Sync checks/uploads the generation selected by Next, invalidating stale relay
-// content on failure. All requests reject redirects; client itself is unchanged.
+// Sync checks/uploads the generation selected by Next. Permanent failures
+// invalidate stale content; transient relay admission failures preserve it.
+// All requests reject redirects; client itself is unchanged.
 func (s *Syncer) Sync(ctx context.Context, client *http.Client, accessToken string) error {
 	if client == nil {
 		return errors.New("cache API transport is unavailable")
@@ -82,6 +83,11 @@ func (s *Syncer) Sync(ctx context.Context, client *http.Client, accessToken stri
 	}
 	err := s.syncSnapshot(ctx, &cacheClient, accessToken)
 	if err != nil && ctx.Err() == nil {
+		var apiErr *types.APIRequestError
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusServiceUnavailable || apiErr.IsRateLimited()) {
+			s.snapshot = nil
+			return err
+		}
 		headers := http.Header{types.HeaderAccessToken: []string{accessToken}}
 		_ = utils.HTTPDoAPIPath(ctx, &cacheClient, &s.relayURL, http.MethodDelete, types.PathSDKCache, nil, headers, nil)
 	}
