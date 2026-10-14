@@ -21,8 +21,12 @@ func Run(ctx context.Context, cfg Config) error {
 	if endpointStateDir == "" {
 		return errors.New("agent.state_dir is required")
 	}
-	if err := os.MkdirAll(endpointStateDir, 0o700); err != nil {
-		return err
+	if err := utils.EnsurePrivateDir(endpointStateDir); err != nil {
+		return fmt.Errorf("secure agent state directory: %w", err)
+	}
+	endpointPath := filepath.Join(endpointStateDir, endpointFilename)
+	if err := utils.EnsurePrivateFile(endpointPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("secure existing agent endpoint: %w", err)
 	}
 	token := utils.RandomID("agent_")
 
@@ -73,13 +77,19 @@ func Run(ctx context.Context, cfg Config) error {
 	listenAddr := listener.Addr().String()
 	manager.controlAddr = listenAddr
 
-	if err := utils.WriteJSONFile(filepath.Join(endpointStateDir, endpointFilename), endpoint{
+	if err := utils.WriteJSONFile(endpointPath, endpoint{
 		ControlAddr: listenAddr,
 		Token:       token,
 	}, 0o600); err != nil {
 		_ = listener.Close()
 		_ = control.Shutdown(context.Background())
 		return err
+	}
+	if err := utils.EnsurePrivateFile(endpointPath); err != nil {
+		_ = listener.Close()
+		_ = control.Shutdown(context.Background())
+		_ = os.Remove(endpointPath)
+		return fmt.Errorf("secure agent endpoint: %w", err)
 	}
 	defer func() {
 		_ = os.Remove(filepath.Join(endpointStateDir, endpointFilename))
