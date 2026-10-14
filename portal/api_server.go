@@ -65,7 +65,7 @@ var (
 	errHostnameConflict         = &apiError{types.APIErrorCodeHostnameConflict, "hostname conflict", http.StatusConflict}
 	errLeaseNotFound            = &apiError{types.APIErrorCodeLeaseNotFound, "lease not found", http.StatusNotFound}
 	errLeaseTTLExceeded         = &apiError{types.APIErrorCodeInvalidRequest, "lease TTL exceeds 10 minutes", http.StatusBadRequest}
-	errLeaseMetadataExceeded     = &apiError{types.APIErrorCodeInvalidRequest, "lease metadata exceeds 16 KiB or 64 tags", http.StatusBadRequest}
+	errLeaseMetadataExceeded    = &apiError{types.APIErrorCodeInvalidRequest, "lease metadata exceeds 16 KiB or 64 tags", http.StatusBadRequest}
 	errLeaseCapacityExceeded    = &apiError{types.APIErrorCodeRateLimited, "relay lease capacity exceeded", http.StatusTooManyRequests}
 	errLeaseRejected            = &apiError{types.APIErrorCodeLeaseRejected, "lease is not approved for routing", http.StatusForbidden}
 	errTransportMismatch        = &apiError{types.APIErrorCodeTransportMismatch, "transport mismatch", http.StatusConflict}

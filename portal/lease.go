@@ -29,7 +29,7 @@ const (
 	maxLeaseMetadataTags                     = 64
 	maxLiveLeases                            = 4096
 	maxLiveLeasesPerSource                   = 128
-	maxPendingRegisterChallenges            = 2048
+	maxPendingRegisterChallenges             = 2048
 	defaultRegisterChallengeTTL              = 2 * time.Minute
 	defaultRegisterChallengeOutstandingPerIP = 32
 	defaultPortReservationGrace              = 5 * time.Minute
