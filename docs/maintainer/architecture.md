@@ -112,7 +112,9 @@ a ban while allowing fresh uploads after an unban without re-registering.
 
 Cache uploads admit at most two active requests, with one per service identity
 (name and address), under the cache manager's lock. Excess requests receive 503;
-manifest checks have independent capacity. Upload reads have a ten-second
+manifest checks have independent capacity. Revoked PUTs retain admission until
+their handlers exit, so restored access may need to retry after a 503.
+Upload reads have a ten-second
 inactivity deadline and a two-minute absolute limit. A changed manifest retires
 the published snapshot so rejected replacement uploads fall back to the origin.
 

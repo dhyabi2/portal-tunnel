@@ -518,12 +518,19 @@ func TestDetachOwnerRejectsInFlightCacheRequests(t *testing.T) {
 			}()
 			<-started
 			c.DetachOwner(lease.Owner)
-			// After access is restored, a fresh request can republish on the
-			// retained lease. The older request must not replace or retire it.
+			// Restored access permits a fresh generation on the retained lease.
+			// An old PUT still owns upload admission until its handler exits.
 			fresh := httptest.NewRecorder()
 			c.Handle(fresh, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
 			close(resume)
 			code := <-codes
+			if method == http.MethodPut {
+				if code != http.StatusForbidden || fresh.Code != http.StatusServiceUnavailable || c.Has(lease.Hostname) {
+					t.Fatalf("revoked PUT = %d, overlapping upload = %d, published = %v", code, fresh.Code, c.Has(lease.Hostname))
+				}
+				fresh = httptest.NewRecorder()
+				c.Handle(fresh, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
+			}
 			if code != http.StatusForbidden || fresh.Code != http.StatusOK {
 				t.Fatalf("old request = %d, fresh upload = %d", code, fresh.Code)
 			}
