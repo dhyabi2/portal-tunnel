@@ -130,13 +130,22 @@ func (s *ReputationStore) CastVote(hostname, identity, vote, cookieID string, so
 	if previous == nil && len(s.state.Identities) >= reputationMaxIdentities {
 		return ReputationSummary{}, "", ErrReputationCapacity
 	}
+	if _, exists := previous[hash]; !exists {
+		if len(previous) >= reputationMaxVoters {
+			return ReputationSummary{}, "", ErrReputationCapacity
+		}
+		// Cookie-free creation still spends the source and shared mint budget.
+		// Reissuing an existing voter's cookie must not pay this charge again.
+		if minted != "" {
+			if retry, _ := s.limiter.Allow(source, 10); retry > 0 {
+				return ReputationSummary{}, "", ErrReputationCapacity
+			}
+		}
+	}
 	nextIdentities := maps.Clone(s.state.Identities)
 	votes := maps.Clone(previous)
 	if votes == nil {
 		votes = make(map[string]string)
-	}
-	if _, exists := votes[hash]; !exists && len(votes) >= reputationMaxVoters {
-		return ReputationSummary{}, "", ErrReputationCapacity
 	}
 	votes[hash] = vote
 	nextIdentities[identity] = votes

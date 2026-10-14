@@ -88,6 +88,16 @@ contract-wallet verification are outside this contract.
 
 ## Admission and Identity Policy
 
+Reputation uses signed voter cookies. Without a valid cookie, the relay derives
+a stable voter from the exact trusted ingress source address (IPv4-mapped
+addresses are unmapped). Cookie-free clients behind one NAT share a voter;
+existing valid cookies remain separate credentials and keep their identity
+when the source changes. IPv6 addresses are not aggregated by prefix. New
+cookie-free voters in a service's ledger spend ten additional source/global
+admission tokens; existing voters spend only the HTTP request budget. Invalid
+sources cannot create voters. This counts voter credentials, not authenticated
+people, and preserves existing signed cookies and the persisted ledger format.
+
 The relay hands root/API and cache TLS connections from its SNI ingress directly
 to the API server, preserving the original socket peer without a local TCP hop.
 Forwarded HTTP headers are accepted only from explicitly trusted proxies; the
