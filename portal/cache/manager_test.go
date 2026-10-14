@@ -359,15 +359,20 @@ func (r *gatedBody) Read(p []byte) (int, error) {
 func TestAdmissionKeepsChecksAndUploadsIndependentlyBounded(t *testing.T) {
 	c := testManager(t, 32) // Cache owns a separate two-request pool for each operation.
 	l := testLease(c, "site")
+	other := testLease(c, "other")
 	resume := make(chan struct{})
 	var workers sync.WaitGroup
 	defer func() { close(resume); workers.Wait() }()
-	for _, method := range []string{http.MethodPost, http.MethodPost, http.MethodPut, http.MethodPut} {
+	for i, method := range []string{http.MethodPost, http.MethodPost, http.MethodPut, http.MethodPut} {
+		lease := l
+		if i == 3 {
+			lease = other
+		}
 		started := make(chan struct{})
 		req := testRequest(t, method, "site")
 		req.Body = &gatedBody{ReadCloser: req.Body, started: started, resume: resume}
 		workers.Add(1)
-		go func() { defer workers.Done(); c.Handle(httptest.NewRecorder(), req, l.ID, c.Generation(l.ID)) }()
+		go func() { defer workers.Done(); c.Handle(httptest.NewRecorder(), req, lease.ID, c.Generation(lease.ID)) }()
 		select {
 		case <-started:
 		case <-time.After(5 * time.Second):
@@ -511,12 +516,19 @@ func TestDetachOwnerRejectsInFlightCacheRequests(t *testing.T) {
 			}()
 			<-started
 			c.DetachOwner(lease.Owner)
-			// After access is restored, a fresh request can republish on the
-			// retained lease. The older request must not replace or retire it.
+			// Restored access permits a fresh generation on the retained lease.
+			// An old PUT still owns upload admission until its handler exits.
 			fresh := httptest.NewRecorder()
 			c.Handle(fresh, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
 			close(resume)
 			code := <-codes
+			if method == http.MethodPut {
+				if code != http.StatusForbidden || fresh.Code != http.StatusServiceUnavailable || c.Has(lease.Hostname) {
+					t.Fatalf("revoked PUT = %d, overlapping upload = %d, published = %v", code, fresh.Code, c.Has(lease.Hostname))
+				}
+				fresh = httptest.NewRecorder()
+				c.Handle(fresh, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
+			}
 			if code != http.StatusForbidden || fresh.Code != http.StatusOK {
 				t.Fatalf("old request = %d, fresh upload = %d", code, fresh.Code)
 			}
@@ -613,6 +625,116 @@ func TestStaticCacheDoesNotFollowRedirects(t *testing.T) {
 	}
 	if foreignRequests.Load() != 0 {
 		t.Fatalf("foreign server received %d requests, want 0 (redirect was followed)", foreignRequests.Load())
+	}
+}
+
+func TestUploadAdmissionIsolatesServiceIdentities(t *testing.T) {
+	c := testManager(t, 64)
+	first := testLease(c, "first")
+	other := testLease(c, "other")
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	done := make(chan int, 1)
+	req := testRequest(t, http.MethodPut, "first")
+	req.Body = &gatedBody{ReadCloser: req.Body, started: started, resume: resume}
+	go func() {
+		w := httptest.NewRecorder()
+		c.Handle(w, req, first.ID, c.Generation(first.ID))
+		done <- w.Code
+	}()
+	defer func() {
+		close(resume)
+		if code := <-done; code != http.StatusOK {
+			t.Errorf("first upload = %d, want 200", code)
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first upload did not start")
+	}
+	w := httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPut, "duplicate"), first.ID, c.Generation(first.ID))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("duplicate upload = %d, want 503", w.Code)
+	}
+	w = httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPut, "other"), other.ID, c.Generation(other.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("another service could not use the remaining slot: %d", w.Code)
+	}
+	// A malformed upload must also release this service's admission.
+	bad := httptest.NewRequest(http.MethodPut, types.PathSDKCache, strings.NewReader("invalid"))
+	w = httptest.NewRecorder()
+	c.Handle(w, bad, other.ID, c.Generation(other.ID))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("malformed upload = %d, want 400", w.Code)
+	}
+	w = httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPut, "retry"), other.ID, c.Generation(other.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed upload retained admission: %d", w.Code)
+	}
+}
+
+func TestChangedManifestFallsBackAcrossRejectedUploadAndRenewal(t *testing.T) {
+	c := testManager(t, 64)
+	lease := testLease(c, "site")
+	w := httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPut, "old"), lease.ID, c.Generation(lease.ID))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	resume := make(chan struct{})
+	var workers sync.WaitGroup
+	defer func() {
+		if resume != nil {
+			close(resume)
+		}
+		workers.Wait()
+	}()
+	for _, name := range []string{"first", "second"} {
+		other := testLease(c, name)
+		started := make(chan struct{})
+		req := testRequest(t, http.MethodPut, name)
+		req.Body = &gatedBody{ReadCloser: req.Body, started: started, resume: resume}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			c.Handle(httptest.NewRecorder(), req, other.ID, c.Generation(other.ID))
+		}()
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("occupying upload did not start")
+		}
+	}
+	w = httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPost, "new"), lease.ID, c.Generation(lease.ID))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("upload at capacity = %d, want 503", w.Code)
+	}
+	lease.LastSeenAt = time.Now().Add(time.Minute)
+	c.Renew(lease)
+	if c.Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "https://"+lease.Hostname+"/", nil), lease.Hostname) {
+		t.Fatal("renewal served a known superseded snapshot after rejected replacement")
+	}
+	close(resume)
+	resume = nil
+	workers.Wait()
+	w = httptest.NewRecorder()
+	c.Handle(w, testRequest(t, http.MethodPut, "new"), lease.ID, c.Generation(lease.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("replacement after capacity recovered = %d, want 200", w.Code)
+	}
+	w = httptest.NewRecorder()
+	if !c.Serve(w, httptest.NewRequest(http.MethodGet, "https://"+lease.Hostname+"/", nil), lease.Hostname) || w.Body.String() != "new" {
+		t.Fatalf("replacement content = %q, want new", w.Body.String())
 	}
 }
 

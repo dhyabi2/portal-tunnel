@@ -43,29 +43,55 @@ func (c *Manager) Handle(w http.ResponseWriter, req *http.Request, leaseID strin
 		utils.WriteAPIData(w, http.StatusOK, types.StaticCacheStatus{})
 		return
 	}
-	// Manifest checks cannot consume upload slots, but still have their own
-	// bounded concurrency, body size, and shorter read deadline.
-	slots, readTimeout := c.population, 2*time.Minute
-	if req.Method == http.MethodPost {
-		slots, readTimeout = c.checks, 10*time.Second
-	}
-	select {
-	case slots <- struct{}{}:
-		defer func() { <-slots }()
-	default:
-		http.Error(w, "relay cache request limit reached; use origin tunnel", http.StatusServiceUnavailable)
-		return
+	// One service identity may hold one of the two upload slots. Checks
+	// have their own capacity; neither operation queues requests.
+	readTimeout := 10 * time.Second
+	if req.Method == http.MethodPut {
+		c.mu.Lock()
+		_, active := c.uploads[site.owner]
+		if active || len(c.uploads) >= 2 {
+			c.mu.Unlock()
+			http.Error(w, "relay cache upload limit reached; use origin tunnel", http.StatusServiceUnavailable)
+			return
+		}
+		c.uploads[site.owner] = struct{}{}
+		c.mu.Unlock()
+		defer func() {
+			c.mu.Lock()
+			delete(c.uploads, site.owner)
+			c.mu.Unlock()
+		}()
+		readTimeout = 2 * time.Minute
+	} else {
+		select {
+		case c.checks <- struct{}{}:
+			defer func() { <-c.checks }()
+		default:
+			http.Error(w, "relay cache request limit reached; use origin tunnel", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	controller := http.NewResponseController(w)
-	_ = controller.SetReadDeadline(time.Now().Add(readTimeout))
-	defer controller.SetReadDeadline(time.Time{})
+	deadline := time.Now().Add(readTimeout)
+	_ = controller.SetReadDeadline(deadline)
 	var manifest types.StaticCacheManifest
 	var err error
+	defer func() {
+		// Keep a failed read's deadline so net/http's unread-body drain
+		// cannot extend a stalled upload after its slot has been released.
+		if err == nil {
+			_ = controller.SetReadDeadline(time.Time{})
+		}
+	}()
 	var parts *multipart.Reader
 	var manifestReader io.Reader = http.MaxBytesReader(w, req.Body, types.StaticCacheManifestLimit)
 	if req.Method == http.MethodPut {
 		// Includes multipart framing and manifest bytes, with a fixed bound.
-		req.Body = http.MaxBytesReader(w, req.Body, c.limits.MaxExposureBytes+2*types.StaticCacheManifestLimit)
+		req.Body = &idleUploadBody{
+			ReadCloser:  http.MaxBytesReader(w, req.Body, c.limits.MaxExposureBytes+2*types.StaticCacheManifestLimit),
+			controller:  controller,
+			maxDeadline: deadline,
+		}
 		parts, err = req.MultipartReader()
 		if err == nil {
 			var part *multipart.Part
@@ -188,4 +214,24 @@ func (c *Manager) Handle(w http.ResponseWriter, req *http.Request, leaseID strin
 	}
 	c.collect(time.Now())
 	utils.WriteAPIData(w, http.StatusOK, status)
+}
+
+const uploadIdleTimeout = 10 * time.Second
+
+// idleUploadBody limits blocking reads while retaining the absolute upload deadline.
+type idleUploadBody struct {
+	io.ReadCloser
+	controller  *http.ResponseController
+	maxDeadline time.Time
+}
+
+func (b *idleUploadBody) Read(p []byte) (int, error) {
+	deadline := time.Now().Add(uploadIdleTimeout)
+	if deadline.After(b.maxDeadline) {
+		deadline = b.maxDeadline
+	}
+	if err := b.controller.SetReadDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return 0, err
+	}
+	return b.ReadCloser.Read(p)
 }

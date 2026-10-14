@@ -120,6 +120,14 @@ generation. Cache requests capture that generation before the final access
 check, and must still match it at publication. This fences uploads that overlap
 a ban while allowing fresh uploads after an unban without re-registering.
 
+Cache uploads admit at most two active requests, with one per service identity
+(name and address), under the cache manager's lock. Excess requests receive 503;
+manifest checks have independent capacity. Revoked PUTs retain admission until
+their handlers exit, so restored access may need to retry after a 503.
+Upload reads have a ten-second
+inactivity deadline and a two-minute absolute limit. A changed manifest retires
+the published snapshot so rejected replacement uploads fall back to the origin.
+
 Source IP remains diagnostic metadata and an ephemeral pre-auth admission signal.
 Registration challenges, registration attempts, and discovery announces share weighted
 per-source and global budgets owned by the relay's admission limiter. The relay applies
