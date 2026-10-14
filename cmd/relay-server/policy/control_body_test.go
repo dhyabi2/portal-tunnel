@@ -100,6 +100,13 @@ func TestControlBodyLimiterRejectsWithoutReadingBody(t *testing.T) {
 	if response.Header.Get("Retry-After") != "1" {
 		t.Fatal("rejected request did not advertise retry guidance")
 	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	var unread [1]byte
+	if n, err := conn.Read(unread[:]); n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("rejected body left its socket open: read (%d, %v)", n, err)
+	}
 }
 
 func TestControlBodyLimiterStopsTrickledJSONAtDeadline(t *testing.T) {
@@ -168,10 +175,10 @@ func TestControlBodyLimiterStopsTrickledJSONAtDeadline(t *testing.T) {
 	}
 }
 
-func TestControlBodyLimiterFailsClosedWithoutReadDeadline(t *testing.T) {
+func TestControlBodyLimiterFailsClosedWithoutBodyControls(t *testing.T) {
 	limiter := newControlBodyLimiter(time.Second)
 	req := httptest.NewRequest(http.MethodPost, types.PathSDKRegister, strings.NewReader("{}"))
-	w := httptest.NewRecorder() // Does not support ResponseController.SetReadDeadline.
+	w := httptest.NewRecorder() // Does not support ResponseController body controls.
 	limiter.serve(w, req, netip.MustParseAddr("192.0.2.1"), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("request decoded without a read deadline")
 	}))
@@ -180,36 +187,6 @@ func TestControlBodyLimiterFailsClosedWithoutReadDeadline(t *testing.T) {
 	}
 	if limiter.active != 0 {
 		t.Fatal("failed deadline retained an active slot")
-	}
-}
-
-func TestControlJSONRequestExcludesUpgradesAndStreamingBodies(t *testing.T) {
-	for _, path := range []string{
-		types.PathSDKRegisterChallenge, types.PathSDKRegister,
-		types.PathSDKRenew, types.PathSDKReverse, types.PathSDKUnregister,
-		types.PathDiscoveryAnnounce, types.PathV1Sign, types.PathAdminAuthLogin,
-		types.PathPolicy, types.PathPolicyLeases, types.PathPolicy + "/",
-		types.PathAPIPrefix + "/reputation/vote", types.PathAPIPrefix + "/x402/verify",
-	} {
-		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}"))
-		if !isControlJSONRequest(r) {
-			t.Errorf("POST %s was not guarded", path)
-		}
-	}
-	for _, test := range []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, types.PathSDKConnect},
-		{http.MethodPost, types.PathSDKConnect},
-		{http.MethodPost, types.PathSDKCache},
-		{http.MethodGet, types.PathSDKRegister},
-		{http.MethodPost, "/user/upload"},
-	} {
-		r := httptest.NewRequest(test.method, test.path, strings.NewReader("{}"))
-		if isControlJSONRequest(r) {
-			t.Errorf("%s %s was incorrectly guarded", test.method, test.path)
-		}
 	}
 }
 

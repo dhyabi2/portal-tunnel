@@ -141,15 +141,18 @@ func Mux(s *portal.Server, fallback http.Handler, ingress *Ingress, admission *S
 	}))
 	mux.Handle("/", fallback)
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	control := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if utils.HandleAPICORS(w, r) {
 			return
 		}
-		if isControlJSONRequest(r) {
-			controlBodies.serve(w, r, ingress.SourceAddr(r), mux)
+		mux.ServeHTTP(w, r)
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && r.Body != http.NoBody {
+			controlBodies.serve(w, r, ingress.SourceAddr(r), control)
 			return
 		}
-		mux.ServeHTTP(w, r)
+		control.ServeHTTP(w, r)
 	})
 }
 

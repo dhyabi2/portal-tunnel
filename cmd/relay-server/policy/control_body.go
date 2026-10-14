@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
@@ -80,57 +79,49 @@ func (b *controlBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// serve bounds active requests and body reads. Calls from Mux exclude
-// long-lived reverse connections and streaming cache uploads.
+// serve bounds ordinary request bodies. Cache POST/PUT handlers own their
+// read deadlines and concurrency, but still need unread-body cleanup when
+// authentication or admission rejects a request before consuming it.
 func (l *controlBodyLimiter) serve(w http.ResponseWriter, r *http.Request, source netip.Addr, next http.Handler) {
-	if !l.acquire(source) {
-		// The body is unread; do not let net/http drain it while replying.
-		w.Header().Set("Connection", "close")
-		_ = http.NewResponseController(w).EnableFullDuplex()
-		WriteRetryAfter(w, time.Second, "too many active control requests")
-		return
-	}
-	defer l.release(source)
-
 	controller := http.NewResponseController(w)
-	if err := controller.SetReadDeadline(time.Now().Add(l.timeout)); err != nil {
-		w.Header().Set("Connection", "close")
-		_ = controller.EnableFullDuplex()
-		utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeFeatureUnavailable, "request body deadline unavailable")
-		return
+	cacheBody := r.URL.Path == types.PathSDKCache && (r.Method == http.MethodPost || r.Method == http.MethodPut)
+	if !cacheBody {
+		if !l.acquire(source) {
+			w.Header().Set("Connection", "close")
+			_ = controller.EnableFullDuplex()
+			_ = controller.SetReadDeadline(time.Now())
+			WriteRetryAfter(w, time.Second, "too many active control requests")
+			return
+		}
+		defer l.release(source)
 	}
-	if err := controller.EnableFullDuplex(); err != nil {
-		w.Header().Set("Connection", "close")
-		utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeFeatureUnavailable, "full-duplex request handling unavailable")
-		return
-	}
-	// Rejecting a partially read body must close the connection immediately.
-	// A complete body clears this before the handler writes its response, so
-	// healthy control requests keep HTTP keep-alive.
-	w.Header().Set("Connection", "close")
+	// This defer runs before slot release. net/http closes the original body
+	// after the handler returns, even for Connection: close responses.
 	body := &controlBody{ReadCloser: r.Body, remaining: r.ContentLength, header: w.Header()}
 	r.Body = body
 	defer func() {
 		if body.complete {
 			_ = controller.SetReadDeadline(time.Time{})
+		} else {
+			_ = controller.SetReadDeadline(time.Now())
 		}
 	}()
+	w.Header().Set("Connection", "close")
+	if err := controller.EnableFullDuplex(); err != nil {
+		utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeFeatureUnavailable, "full-duplex request handling unavailable")
+		return
+	}
+	if !cacheBody {
+		if err := controller.SetReadDeadline(time.Now().Add(l.timeout)); err != nil {
+			utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeFeatureUnavailable, "request body deadline unavailable")
+			return
+		}
+	}
+	// A reverse upgrade has no HTTP request body. Reject one before hijacking,
+	// so the body cleanup deadline cannot affect a live reverse connection.
+	if r.URL.Path == types.PathSDKConnect && r.Method == http.MethodGet {
+		utils.WriteAPIError(w, http.StatusBadRequest, types.APIErrorCodeInvalidRequest, "reverse connect must not include a request body")
+		return
+	}
 	next.ServeHTTP(w, r)
-}
-
-// isControlJSONRequest names the short-lived control requests. Keeping the
-// selection here leaves reverse upgrades and streaming cache uploads alone.
-func isControlJSONRequest(r *http.Request) bool {
-	if r.Method != http.MethodPost || r.Body == http.NoBody {
-		return false
-	}
-	switch strings.TrimSuffix(r.URL.Path, "/") {
-	case types.PathSDKRegisterChallenge, types.PathSDKRegister,
-		types.PathSDKRenew, types.PathSDKReverse, types.PathSDKUnregister,
-		types.PathDiscoveryAnnounce, types.PathV1Sign,
-		types.PathAdminAuthLogin, types.PathPolicy, types.PathPolicyLeases:
-		return true
-	}
-	return r.URL.Path == types.PathAPIPrefix+"/reputation/vote" ||
-		strings.HasPrefix(r.URL.Path, types.PathAPIPrefix+"/x402/")
 }
