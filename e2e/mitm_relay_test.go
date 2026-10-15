@@ -1,47 +1,33 @@
 package e2e_test
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gosuda/keyless_tls/relay/l4"
+
+	"github.com/gosuda/portal-tunnel/v2/sdk"
 )
 
-const (
-	mitmVisitorSecret = "portal-e2e-visitor-secret"
-	mitmForgedBody    = "relay-forged-response"
-)
-
-// mitmIngress sits in front of a real relay and holds that relay's certificate
-// key, just as a malicious operator would. Control and reverse connections go
-// to the real relay unchanged; tenant TLS can be split into two real sessions.
-// Attack decisions use only source addresses, ClientHello, or decrypted bytes.
+// mitmIngress holds the real relay's key and splits tenant TLS into two real
+// sessions. Control, reverse transport and transcript signing remain unchanged.
 type mitmIngress struct {
-	backend       string
-	attack        string
-	cert          tls.Certificate
-	roots         *x509.CertPool
-	probes        chan time.Duration
-	workers       sync.WaitGroup
-	mu            sync.Mutex
-	controlSource string
-	probeStarts   int
-	reads         int
-	writes        int
-	bytes         int
+	backend     string
+	cert        tls.Certificate
+	roots       *x509.CertPool
+	reject      bool
+	rejected    chan struct{}
+	probeStarts atomic.Int64
+	workers     sync.WaitGroup
 }
 
 func startMITMIngress(t *testing.T, parent context.Context, addr, backend, stateDir, attack string) *mitmIngress {
@@ -64,8 +50,8 @@ func startMITMIngress(t *testing.T, parent context.Context, addr, backend, state
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m := &mitmIngress{
-		backend: backend, attack: attack, cert: cert, roots: roots,
-		probes: make(chan time.Duration, 32),
+		backend: backend, cert: cert, roots: roots, reject: attack == "reject",
+		rejected: make(chan struct{}, 16),
 	}
 	m.workers.Add(1)
 	go func() {
@@ -94,136 +80,42 @@ func startMITMIngress(t *testing.T, parent context.Context, addr, backend, state
 }
 
 func (m *mitmIngress) serve(ctx context.Context, raw net.Conn) {
-	hello, conn, err := l4.InspectClientHello(raw, 5*time.Second)
+	hello, client, err := l4.InspectClientHello(raw, 5*time.Second)
 	if err != nil {
 		return
 	}
-	// IP-literal relay API requests carry no SNI. They must stay intact so
-	// registration, reverse transport and transcript-bound signing are real.
-	source, _, _ := net.SplitHostPort(raw.RemoteAddr().String())
-	if hello.ServerName == "" {
-		m.mu.Lock()
-		m.controlSource = source
-		m.mu.Unlock()
-		m.forward(ctx, conn, nil, "")
-		return
-	}
-	started := time.Now()
-	// The evaluator's visitors explicitly offer http/1.1, unlike the current
-	// SDK probe. This observation is not a hidden probe label. Only the
-	// ClientHello attack uses it to choose whether to terminate a connection.
-	if len(hello.ALPNProtocols) == 0 {
-		m.mu.Lock()
-		m.probeStarts++
-		m.mu.Unlock()
-		defer func() {
-			select {
-			case m.probes <- time.Since(started):
-			case <-ctx.Done():
-			}
-		}()
-	}
-	if m.attack == "reject" && len(hello.ALPNProtocols) == 0 {
-		return // Abort before the handshake, so failure is immediate.
-	}
-	m.mu.Lock()
-	controlSource := m.controlSource
-	m.mu.Unlock()
-	if m.attack == "passthrough" ||
-		m.attack == "source" && source == controlSource ||
-		m.attack == "target" && source != "127.0.0.2" ||
-		m.attack == "hello" && len(hello.ALPNProtocols) == 0 {
-		m.forward(ctx, conn, nil, "")
-		return
-	}
-	client := tls.Server(conn, &tls.Config{
-		Certificates: []tls.Certificate{m.cert}, MinVersion: tls.VersionTLS13,
-		NextProtos: []string{"http/1.1"},
-	})
-	if err := client.HandshakeContext(ctx); err != nil {
-		return
-	}
-	_ = client.SetDeadline(time.Now().Add(45 * time.Second))
-	reader := bufio.NewReader(client)
-	request, err := http.ReadRequest(reader)
-	if err != nil {
-		return
-	}
-	defer request.Body.Close()
-	// Adapt to the HTTP probe: this rule inspects an ordinary tracing header
-	// after TLS termination instead of relying on a raw random frame.
-	if request.Method == http.MethodHead && request.Header.Get("Traceparent") != "" {
-		switch m.attack {
-		case "reset":
-			_ = raw.(*net.TCPConn).SetLinger(0)
-			return
-		case "stall":
-			_, _ = io.Copy(io.Discard, reader)
-			return
-		case "strip":
-			request.Header.Del("Traceparent")
-		}
-		var replay bytes.Buffer
-		if err := request.Write(&replay); err != nil {
-			return
-		}
-		m.forward(ctx, client, io.MultiReader(&replay, reader), hello.ServerName)
-		return
-	}
-	secret := request.Header.Get("Authorization")
-	m.mu.Lock()
-	m.reads++
-	m.bytes += len(secret)
-	m.mu.Unlock()
-
-	if m.attack != "source" && m.attack != "target" {
-		upstream, err := m.dialTenant(ctx, hello.ServerName)
-		if err != nil {
-			return
-		}
-		defer upstream.Close()
-		stop := context.AfterFunc(ctx, func() { _ = upstream.Close() })
-		defer stop()
-		_ = upstream.SetDeadline(time.Now().Add(10 * time.Second))
-		if err := request.Write(upstream); err != nil {
-			return
-		}
-		response, err := http.ReadResponse(bufio.NewReader(upstream), request)
-		if err != nil {
-			return
-		}
-		_, err = io.Copy(io.Discard, response.Body)
-		_ = response.Body.Close()
-		if err != nil {
-			return
-		}
-	}
-	// The source-selective operator does not need a live tunnel to forge a
-	// page. Other modes forward the request first to start the real probe.
-	_, err = fmt.Fprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(mitmForgedBody), mitmForgedBody)
-	if err == nil {
-		m.mu.Lock()
-		m.writes++
-		m.mu.Unlock()
-	}
-}
-
-func (m *mitmIngress) dialTenant(ctx context.Context, hostname string) (net.Conn, error) {
-	return (&tls.Dialer{Config: &tls.Config{
-		ServerName: hostname, RootCAs: m.roots, MinVersion: tls.VersionTLS13,
-		NextProtos: []string{"http/1.1"},
-	}}).DialContext(ctx, "tcp", m.backend)
-}
-
-// forward bridges real sockets, replaying any decrypted bytes inspected by
-// the attacker. No SDK state, fake transport or signing bypass is involved.
-func (m *mitmIngress) forward(ctx context.Context, client net.Conn, reader io.Reader, hostname string) {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	var upstream net.Conn
-	var err error
-	if hostname == "" {
-		upstream, err = (&net.Dialer{}).DialContext(ctx, "tcp", m.backend)
+	if hello.ServerName == "" {
+		// IP-literal API/reverse connections have no SNI.
+		upstream, err = dialer.DialContext(ctx, "tcp", m.backend)
 	} else {
-		upstream, err = m.dialTenant(ctx, hostname)
+		// Visitors explicitly offer HTTP/1.1. Only the native probe omits
+		// ALPN in this fixture; the rejection rule uses public metadata.
+		if len(hello.ALPNProtocols) == 0 {
+			m.probeStarts.Add(1)
+			if m.reject {
+				select {
+				case m.rejected <- struct{}{}:
+				case <-ctx.Done():
+				}
+				return
+			}
+		}
+		handshakeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		terminated := tls.Server(client, &tls.Config{
+			Certificates: []tls.Certificate{m.cert}, MinVersion: tls.VersionTLS13,
+			NextProtos: []string{"http/1.1"},
+		})
+		if err := terminated.HandshakeContext(handshakeCtx); err != nil {
+			return
+		}
+		client = terminated
+		upstream, err = (&tls.Dialer{NetDialer: dialer, Config: &tls.Config{
+			ServerName: hello.ServerName, RootCAs: m.roots, MinVersion: tls.VersionTLS13,
+			NextProtos: []string{"http/1.1"},
+		}}).DialContext(handshakeCtx, "tcp", m.backend)
 	}
 	if err != nil {
 		return
@@ -231,12 +123,9 @@ func (m *mitmIngress) forward(ctx context.Context, client net.Conn, reader io.Re
 	defer upstream.Close()
 	stop := context.AfterFunc(ctx, func() { _ = upstream.Close() })
 	defer stop()
-	if reader == nil {
-		reader = client
-	}
 	done := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(upstream, reader)
+		_, _ = io.Copy(upstream, client)
 		_ = upstream.Close()
 		close(done)
 	}()
@@ -246,35 +135,54 @@ func (m *mitmIngress) forward(ctx context.Context, client net.Conn, reader io.Re
 	<-done
 }
 
-// mitmVisit is an ordinary HTTPS client. A local source address models a
-// separately identifiable visitor; TLS still verifies the real relay chain.
-func mitmVisit(h *harness, publicURL, source string) (string, error) {
-	target, err := http.NewRequest(http.MethodGet, publicURL+"/marker", nil)
-	if err != nil {
-		return "", err
+func TestMITMTerminationExcludesRelay(t *testing.T) {
+	h := newHarnessWithName(t, "termination", "127.0.0.1", "terminate", sdk.WithMITMProtection(true))
+	publicURL := h.waitForPublicURL()
+	// The application request starts the self-probe. Exclusion may close
+	// that request before its response arrives; assert the public verdict.
+	_, _ = h.tryGet(publicURL)
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		statuses := h.exposure.Relays()
+		if len(statuses) == 1 && statuses[0].State == sdk.RelayFailed && statuses[0].Failure == sdk.RelayFailureMITM {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("forwarded TLS termination did not exclude relay: %+v", statuses)
+		case <-tick.C:
+		}
 	}
-	dialer := &net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(source)}}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, err := (&tls.Dialer{NetDialer: dialer, Config: &tls.Config{
-		ServerName: target.URL.Hostname(), RootCAs: h.mitm.roots,
-		MinVersion: tls.VersionTLS13, NextProtos: []string{"http/1.1"},
-	}}).DialContext(ctx, "tcp", h.sniAddr)
-	if err != nil {
-		return "", err
+}
+
+// Failure must not amplify an ordinary visitor burst into fresh probe retries.
+func TestMITMProbeFailureBudget(t *testing.T) {
+	h := newHarnessWithName(t, "failure-budget", "127.0.0.1", "reject", sdk.WithMITMProtection(true))
+	publicURL := h.waitForPublicURL()
+	started := time.Now()
+	if got := h.get(publicURL); got != marker {
+		t.Fatalf("visitor response = %q, want %q", got, marker)
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	target.Header.Set("Authorization", mitmVisitorSecret)
-	target.Close = true
-	if err := target.Write(conn); err != nil {
-		return "", err
+	select {
+	case <-h.mitm.rejected:
+	case <-time.After(10 * time.Second):
+		t.Fatal("relay did not receive the first probe")
 	}
-	response, err := http.ReadResponse(bufio.NewReader(conn), target)
-	if err != nil {
-		return "", err
+	for range 10 {
+		if got := h.get(publicURL); got != marker {
+			t.Fatalf("visitor response = %q, want %q", got, marker)
+		}
 	}
-	defer response.Body.Close()
-	content, err := io.ReadAll(response.Body)
-	return strings.TrimSpace(string(content)), err
+	if time.Since(started) >= 30*time.Second {
+		t.Fatal("visitor burst exceeded the cooldown observation window")
+	}
+	if probes := h.mitm.probeStarts.Load(); probes > 1 {
+		t.Fatalf("failed-probe budget exceeded: %d connections during one cooldown", probes)
+	}
+	if statuses := h.exposure.Relays(); len(statuses) != 1 || statuses[0].State != sdk.RelayReady || statuses[0].Failure != "" {
+		t.Fatalf("probe handshake failure must preserve service without a MITM verdict: %+v", statuses)
+	}
 }

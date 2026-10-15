@@ -157,7 +157,7 @@ func (h *harness) close() {
 	h.service.Close()
 	select {
 	case err := <-h.proxyDone:
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			h.t.Errorf("proxy exposure: %v", err)
 		}
 	case <-time.After(5 * time.Second):
@@ -202,7 +202,7 @@ func tenantGet(sniAddr, certPath, publicURL string) (string, bool) {
 		return "", false
 	}
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+		TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, network, sniAddr)
 		},

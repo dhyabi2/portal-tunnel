@@ -120,9 +120,8 @@ a separate TLS connection to its own public tenant hostname. The initiating
 side verifies the hostname against the relay certificate chain that the SDK
 has obtained. Public relay connections use normal CA verification; the
 [local-development bootstrap](/security-model#local-development-trust) has a
-separate trust policy. A random nonce carried in a valid HTTP/1.1 tracing header
-lets the tunnel recognize the returning probe before forwarding it to the
-application.
+separate trust policy. A random nonce sent inside the connection lets the tunnel
+recognize the returning probe before forwarding it to the application.
 
 Both ends use the same TLS exporter label and context to derive a value from
 their TLS session. If the relay forwards the probe, the two ends belong to the
@@ -148,9 +147,8 @@ result therefore establishes passthrough only for the sampled connection; it
 does not certify the relay, prove prior requests were safe, or guarantee what
 will happen to another client's connection. A malicious relay might forward
 recognizable probes while attacking other traffic, or prevent a probe from
-finishing. Valid HTTP syntax and randomized cooldowns do not prove that probes
-are indistinguishable from real application traffic. The probe retains the
-native Go TLS fingerprint and shares the tunnel host's network origin.
+finishing. Random padding does not prove that probes are indistinguishable
+from real application traffic.
 
 An explicit blocking request fails at startup if the tenant TLS stack cannot
 export keying material. This capability check is useful, but it does not turn
