@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,46 @@ func mustSigningIdentity(t *testing.T) types.Identity {
 		t.Fatalf("identity.ResolveSecp256k1Identity() error = %v", err)
 	}
 	return signingIdentity
+}
+
+// A directly contacted relay can advertise many colluding identities and
+// misleading metadata about a healthy peer. Those claims neither verify the
+// advertised URLs nor revoke or rewrite the healthy peer's local observation.
+func TestColludingGossipCannotReplaceLocalRelayEvidence(t *testing.T) {
+	set := NewRelaySet(nil)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	const healthy, reporter = "https://healthy.example", "https://reporter.example"
+	healthyDescriptor := mustSignedDescriptor(t, mustSigningIdentity(t), healthy, now)
+	mustApplyAuthoritative(t, set, healthyDescriptor)
+	reporterDescriptor := mustSignedDescriptor(t, mustSigningIdentity(t), reporter, now)
+	forged := healthyDescriptor
+	forged.SupportsTCP = !forged.SupportsTCP // No signature authorizes this change.
+	for i := range 4 {
+		colluder := mustSignedDescriptor(t, mustSigningIdentity(t), fmt.Sprintf("https://colluder-%d.example", i), now)
+		_, err := set.ApplyRelayDiscoveryResponse(reporter, types.DiscoveryResponse{
+			ProtocolVersion: types.DiscoveryVersion,
+			Relays:          []types.RelayDescriptor{reporterDescriptor, colluder, forged},
+			IncompatibleRelays: []types.IncompatibleRelayEntry{{
+				URL: healthy, ProtocolVersion: "claimed-incompatible", LastSeenAt: now,
+			}},
+			RelayReleaseVersions: map[string]string{healthy: "claimed-release"},
+		}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected := set.SelectRelays(routeState{})
+	if len(selected) != 2 || !slices.Contains(selected, healthy) || !slices.Contains(selected, reporter) {
+		t.Fatalf("gossip manufactured selectable relays or excluded the healthy peer: %v", selected)
+	}
+	if len(set.KnownIncompatibleRelays()) != 0 || set.KnownRelayReleaseVersions()[healthy] != "" {
+		t.Fatal("reporter's peer metadata replaced a direct observation")
+	}
+	for _, desc := range set.Descriptors(types.RelayDescriptor{}) {
+		if desc.APIHTTPSAddr == healthy && desc.Signature != healthyDescriptor.Signature {
+			t.Fatal("forged capabilities replaced the healthy peer's signed descriptor")
+		}
+	}
 }
 
 func mustUnsignedDescriptor(t *testing.T, signing types.Identity, relayURL string) types.RelayDescriptor {
