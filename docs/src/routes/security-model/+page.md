@@ -168,7 +168,11 @@ those changes.
 
 After real application traffic starts, the native SDK asynchronously opens a
 separate TLS connection to its public tenant hostname. A random nonce identifies
-the returning probe after SDK-side TLS termination. Both TLS endpoints export
+the returning probe after SDK-side TLS termination. The probe sends a valid
+HTTP/1.1 `HEAD /` request carrying the nonce as a `traceparent` trace ID. The
+listener recognizes outstanding nonces before application dispatch, with a
+4 KiB header bound and a 100 ms inspection deadline; unrecognized bytes remain
+available to the application. Both TLS endpoints export
 keying material with the same label and context, and the SDK compares the values.
 
 - Matching values support passthrough for that sampled connection.
@@ -187,19 +191,25 @@ keying material with the same label and context, and the SDK compares the values
 
 Serving traffic does not wait for the probe to pass. The probe is triggered by
 each connection's first application read or write, limited to one in flight,
-and subject to a 30-second cooldown after every attempt, including errors and
-timeouts. Long-lived connections do not trigger further probes on later requests;
-there is no background heartbeat.
+and subject to a randomized cooldown of 30 to less than 60 seconds after every
+attempt, including errors and timeouts. Long-lived connections do not trigger
+further probes on later requests; there is no background heartbeat. Clearing
+the lease cancels its active probe, and that attempt cannot update the next
+lease's scheduling state. Probe socket I/O shares the overall timeout and is
+closed when the attempt is canceled.
 It cannot establish that other clients or connections were forwarded honestly.
 In particular, selective MITM and probe distinguishability remain limitations;
-random padding does not establish that probes are indistinguishable from normal
-application traffic.
+valid HTTP syntax does not establish that probes are indistinguishable from
+normal application traffic. The probe retains the native Go ClientHello and
+does not imitate a browser TLS fingerprint.
 
 An adaptive relay can use source IPs, ClientHello metadata, timing, or decrypted
 payloads to distinguish probes. It can forward connections from the tunnel host
 while attacking a selected visitor, or suppress the nonce after terminating TLS.
-Random scheduling, valid HTTP payloads, and additional vantage points may reduce
-particular fingerprints; none supplies independent server authentication.
+Randomized cooldowns and valid HTTP payloads reduce particular fingerprints;
+they retain a minimum quiet interval and do not prevent adaptive classification.
+Additional vantage points would also require separate evaluation. None of these
+techniques supplies independent server authentication.
 
 Both sides must support TLS keying material export. An explicit `--ban-mitm`
 request fails at startup when the selected tenant TLS stack lacks that

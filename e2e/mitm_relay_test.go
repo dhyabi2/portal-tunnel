@@ -145,11 +145,14 @@ func (m *mitmIngress) serve(ctx context.Context, raw net.Conn) {
 	}
 	_ = client.SetDeadline(time.Now().Add(45 * time.Second))
 	reader := bufio.NewReader(client)
-	prefix, err := reader.Peek(16)
+	request, err := http.ReadRequest(reader)
 	if err != nil {
 		return
 	}
-	if !bytes.HasPrefix(prefix, []byte("GET ")) {
+	defer request.Body.Close()
+	// Adapt to the HTTP probe: this rule inspects an ordinary tracing header
+	// after TLS termination instead of relying on a raw random frame.
+	if request.Method == http.MethodHead && request.Header.Get("Traceparent") != "" {
 		switch m.attack {
 		case "reset":
 			_ = raw.(*net.TCPConn).SetLinger(0)
@@ -158,18 +161,15 @@ func (m *mitmIngress) serve(ctx context.Context, raw net.Conn) {
 			_, _ = io.Copy(io.Discard, reader)
 			return
 		case "strip":
-			// Remove the entire nonce without knowing its value or consulting
-			// the SDK's pending map; the remaining bytes cannot complete it.
-			_, _ = reader.Discard(16)
+			request.Header.Del("Traceparent")
 		}
-		m.forward(ctx, client, reader, hello.ServerName)
+		var replay bytes.Buffer
+		if err := request.Write(&replay); err != nil {
+			return
+		}
+		m.forward(ctx, client, io.MultiReader(&replay, reader), hello.ServerName)
 		return
 	}
-	request, err := http.ReadRequest(reader)
-	if err != nil {
-		return
-	}
-	defer request.Body.Close()
 	secret := request.Header.Get("Authorization")
 	m.mu.Lock()
 	m.reads++

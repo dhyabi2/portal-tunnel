@@ -6,11 +6,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,8 +60,7 @@ func probeExporter(conn net.Conn) (func(label string, context []byte, length int
 const (
 	mitmProbeExporterLabel = "Portal-MITM-Probe-v1"
 	mitmProbePeekTimeout   = 100 * time.Millisecond
-	mitmProbePaddingMin    = 96
-	mitmProbePaddingMax    = 320
+	mitmProbeHeaderLimit   = 4096
 
 	defaultMITMProbeCooldown = 30 * time.Second
 	defaultMITMProbeTimeout  = 30 * time.Second
@@ -88,10 +90,11 @@ type mitmManager struct {
 	listener         *listener
 	ban              bool
 
-	mu       sync.Mutex
-	pending  map[mitmProbeNonce]*mitmProbePending
-	inFlight bool
-	lastAt   time.Time
+	mu          sync.Mutex
+	pending     map[mitmProbeNonce]*mitmProbePending
+	inFlight    context.Context
+	cancelProbe context.CancelFunc
+	nextAt      time.Time
 }
 
 func newMITMManager(ctx context.Context, listener *listener, ban bool) *mitmManager {
@@ -105,9 +108,13 @@ func newMITMManager(ctx context.Context, listener *listener, ban bool) *mitmMana
 
 func (m *mitmManager) reset() {
 	m.mu.Lock()
+	if m.cancelProbe != nil {
+		m.cancelProbe()
+		m.cancelProbe = nil
+	}
 	clear(m.pending)
-	m.inFlight = false
-	m.lastAt = time.Time{}
+	m.inFlight = nil
+	m.nextAt = time.Time{}
 	m.mu.Unlock()
 }
 
@@ -180,6 +187,12 @@ func (m *mitmManager) probeTLSPassthrough(ctx context.Context) (mitmProbeReport,
 	}
 	tlsConn := tls.Client(rawConn, probeTLSConf)
 	defer tlsConn.Close()
+	deadline, _ := probeCtx.Deadline()
+	if err := rawConn.SetDeadline(deadline); err != nil {
+		return report, fmt.Errorf("set mitm probe deadline: %w", err)
+	}
+	stopClose := context.AfterFunc(probeCtx, func() { _ = rawConn.Close() })
+	defer stopClose()
 
 	// Reserve the nonce once the TCP connection exists but before the TLS
 	// handshake: the reverse side can hand the connection to Accept as soon
@@ -199,21 +212,17 @@ func (m *mitmManager) probeTLSPassthrough(ctx context.Context) (mitmProbeReport,
 	}
 	m.attachExpected(nonce, expected)
 
-	paddingLen := mitmProbePaddingMin
-	if paddingRange := mitmProbePaddingMax - mitmProbePaddingMin; paddingRange > 0 {
-		var paddingSeed [1]byte
-		if _, err := io.ReadFull(rand.Reader, paddingSeed[:]); err != nil {
-			return report, fmt.Errorf("generate probe padding length: %w", err)
-		}
-		paddingLen += int(paddingSeed[0]) % (paddingRange + 1)
+	var spanID [8]byte
+	if _, err := io.ReadFull(rand.Reader, spanID[:]); err != nil {
+		return report, fmt.Errorf("generate probe span id: %w", err)
 	}
-
-	frame := make([]byte, len(nonce)+paddingLen)
-	if _, err := io.ReadFull(rand.Reader, frame); err != nil {
-		return report, fmt.Errorf("generate probe frame: %w", err)
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodHead, publicURL, nil)
+	if err != nil {
+		return report, fmt.Errorf("create mitm probe request: %w", err)
 	}
-	copy(frame, nonce[:])
-	if _, err := tlsConn.Write(frame); err != nil {
+	request.Close = true
+	request.Header.Set("Traceparent", "00-"+hex.EncodeToString(nonce[:])+"-"+hex.EncodeToString(spanID[:])+"-01")
+	if err := request.Write(tlsConn); err != nil {
 		return report, fmt.Errorf("write mitm probe: %w", err)
 	}
 
@@ -269,21 +278,34 @@ func (m *mitmManager) maybeStart() {
 	}
 
 	m.mu.Lock()
-	if m.inFlight || !m.lastAt.IsZero() && time.Since(m.lastAt) < defaultMITMProbeCooldown {
+	if m.inFlight != nil || time.Now().Before(m.nextAt) {
 		m.mu.Unlock()
 		return
 	}
-	m.inFlight = true
+	probeCtx, cancel := context.WithCancel(m.ctx)
+	m.inFlight = probeCtx
+	m.cancelProbe = cancel
 	m.mu.Unlock()
 
 	go func() {
-		report, err := m.probeTLSPassthrough(m.ctx)
+		defer cancel()
+		report, err := m.probeTLSPassthrough(probeCtx)
+		cooldown := defaultMITMProbeCooldown
+		var jitter [1]byte
+		if _, err := io.ReadFull(rand.Reader, jitter[:]); err == nil {
+			cooldown += time.Duration(jitter[0]) * defaultMITMProbeCooldown / 256
+		}
 		m.mu.Lock()
-		m.inFlight = false
+		if m.inFlight != probeCtx {
+			m.mu.Unlock()
+			return // The lease was cleared while this attempt was running.
+		}
+		m.inFlight = nil
+		m.cancelProbe = nil
 		// Failed attempts consume the same budget as completed comparisons.
 		// Otherwise a relay can reject each handshake and turn a burst of
 		// visitor connections into an unbounded burst of probe retries.
-		m.lastAt = time.Now()
+		m.nextAt = time.Now().Add(cooldown)
 		m.mu.Unlock()
 		m.logResult(report, err)
 	}()
@@ -362,17 +384,39 @@ func (m *mitmManager) maybeHandleConn(conn net.Conn) (net.Conn, bool, error) {
 		return conn, false, nil
 	}
 
-	frameSize := len(mitmProbeNonce{})
-	reader := bufio.NewReaderSize(conn, frameSize)
+	reader := bufio.NewReaderSize(conn, mitmProbeHeaderLimit)
 	_ = conn.SetReadDeadline(time.Now().Add(mitmProbePeekTimeout))
-	peeked, _ := reader.Peek(frameSize)
 	defer conn.SetReadDeadline(time.Time{})
-	if len(peeked) != frameSize {
+	var header []byte
+	for reader.Buffered() < mitmProbeHeaderLimit {
+		if _, err := reader.Peek(reader.Buffered() + 1); err != nil {
+			return wrapBufferedConn(conn, reader), false, nil
+		}
+		buffered, _ := reader.Peek(reader.Buffered())
+		if end := bytes.Index(buffered, []byte("\r\n\r\n")); end >= 0 {
+			header = buffered[:end+4]
+			break
+		}
+	}
+	if header == nil {
+		return wrapBufferedConn(conn, reader), false, nil
+	}
+	request, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(header)))
+	if err != nil {
+		return wrapBufferedConn(conn, reader), false, nil
+	}
+	defer request.Body.Close()
+	trace := strings.Split(request.Header.Get("Traceparent"), "-")
+	if request.Method != http.MethodHead || request.RequestURI != "/" ||
+		request.ContentLength != 0 || len(request.TransferEncoding) != 0 ||
+		len(trace) != 4 || trace[0] != "00" || len(trace[1]) != 32 || len(trace[2]) != 16 || len(trace[3]) != 2 {
 		return wrapBufferedConn(conn, reader), false, nil
 	}
 
 	var nonce mitmProbeNonce
-	copy(nonce[:], peeked[:frameSize])
+	if _, err := hex.Decode(nonce[:], []byte(trace[1])); err != nil {
+		return wrapBufferedConn(conn, reader), false, nil
+	}
 	m.mu.Lock()
 	_, ok = m.pending[nonce]
 	m.mu.Unlock()
@@ -381,11 +425,6 @@ func (m *mitmManager) maybeHandleConn(conn net.Conn) (net.Conn, bool, error) {
 	}
 
 	defer conn.Close()
-
-	frame := make([]byte, frameSize)
-	if _, err := io.ReadFull(reader, frame); err != nil {
-		return nil, true, fmt.Errorf("read mitm probe frame: %w", err)
-	}
 
 	actual, err := exportFn(mitmProbeExporterLabel, nil, 32)
 	if err != nil {
@@ -396,7 +435,7 @@ func (m *mitmManager) maybeHandleConn(conn net.Conn) (net.Conn, bool, error) {
 	return nil, true, nil
 }
 
-// reserveProbe registers the probe nonce before the TLS dial so the reverse
+// reserveProbe registers the probe nonce before the TLS handshake so the reverse
 // side recognizes the connection even if Accept runs the moment the reverse
 // handshake completes. attachExpected arms the reservation afterwards; until
 // then the entry holds no exporter value and a completion attempt reports a

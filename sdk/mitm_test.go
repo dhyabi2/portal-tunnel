@@ -90,8 +90,8 @@ func TestMITMProbeCompletionClassifiesExporter(t *testing.T) {
 }
 
 // TestWrapBufferedConnRedeliversPeekedBytes proves tenant stream integrity
-// while a probe is pending: the nonce frame the probe peek consumed from the
-// wire is re-delivered to the passthrough conn ahead of the remaining bytes.
+// while a probe is pending: bytes buffered during probe inspection are
+// re-delivered to the passthrough conn ahead of the remaining bytes.
 func TestWrapBufferedConnRedeliversPeekedBytes(t *testing.T) {
 	const frameSize = 16
 	payload := append(bytes.Repeat([]byte{0x00}, frameSize), bytes.Repeat([]byte{0xAB}, 8)...)
@@ -123,7 +123,7 @@ func TestWrapBufferedConnRedeliversPeekedBytes(t *testing.T) {
 		t.Fatalf("passthrough payload = % x, want % x", got, payload)
 	}
 	if !bytes.Equal(peeked, payload[:frameSize]) {
-		t.Fatalf("peeked frame = % x, want the probe nonce frame % x", peeked, payload[:frameSize])
+		t.Fatalf("peeked bytes = % x, want % x", peeked, payload[:frameSize])
 	}
 	if err := <-writeErr; err != nil {
 		t.Fatalf("client Write() error = %v", err)
