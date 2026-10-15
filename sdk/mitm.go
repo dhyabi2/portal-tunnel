@@ -278,12 +278,12 @@ func (m *mitmManager) maybeStart() {
 
 	go func() {
 		report, err := m.probeTLSPassthrough(m.ctx)
-		success := err == nil && report.Reason != types.MITMProbeReasonProbeTimeout
 		m.mu.Lock()
 		m.inFlight = false
-		if success {
-			m.lastAt = time.Now()
-		}
+		// Failed attempts consume the same budget as completed comparisons.
+		// Otherwise a relay can reject each handshake and turn a burst of
+		// visitor connections into an unbounded burst of probe retries.
+		m.lastAt = time.Now()
 		m.mu.Unlock()
 		m.logResult(report, err)
 	}()

@@ -179,15 +179,27 @@ keying material with the same label and context, and the SDK compares the values
   URL in its in-memory state. That ban has no automatic expiry and survives
   refresh and rediscovery until `AddRelay()` clears it. Both bans end when the
   exposure is replaced; neither is durable across client restarts or network-wide.
+  This does not revoke the relay's certificate or withdraw its hostname. An
+  operator holding that key can still serve forged pages at the public URL
+  after the tunnel disconnects.
 - Timeouts, connection failures, and other probe errors are warnings, not
   exporter-mismatch verdicts; they do not trigger that block.
 
 Serving traffic does not wait for the probe to pass. The probe is triggered by
-traffic, limited to one in flight, and rate-limited after a completed result.
+each connection's first application read or write, limited to one in flight,
+and subject to a 30-second cooldown after every attempt, including errors and
+timeouts. Long-lived connections do not trigger further probes on later requests;
+there is no background heartbeat.
 It cannot establish that other clients or connections were forwarded honestly.
 In particular, selective MITM and probe distinguishability remain limitations;
 random padding does not establish that probes are indistinguishable from normal
 application traffic.
+
+An adaptive relay can use source IPs, ClientHello metadata, timing, or decrypted
+payloads to distinguish probes. It can forward connections from the tunnel host
+while attacking a selected visitor, or suppress the nonce after terminating TLS.
+Random scheduling, valid HTTP payloads, and additional vantage points may reduce
+particular fingerprints; none supplies independent server authentication.
 
 Both sides must support TLS keying material export. An explicit `--ban-mitm`
 request fails at startup when the selected tenant TLS stack lacks that
@@ -198,6 +210,30 @@ disables probing, and cannot be combined with `--ban-mitm`.
 The [probe implementation](https://github.com/gosuda/portal-tunnel/blob/main/sdk/mitm.go)
 defines these verdicts and their lifecycle. A successful probe is evidence about
 one connection, not an authorization to trust every future connection.
+
+### Protection after probe evasion
+
+Clients requiring confidentiality and integrity despite malicious relay
+termination need an independently authenticated secure channel. Both the expected
+server identity and the client verification code must come from a trusted path
+outside the relay's control. Verification JavaScript or keys delivered only by
+the relay can be replaced. A message signature alone does not encrypt data or
+prevent replay; Portal's SIWE registration identity does not itself implement
+an application encryption protocol.
+
+Ordinary browsers rely on hostname authentication. Keeping a tenant certificate
+key at the tunnel is insufficient if the relay retains a covering wildcard key
+or can obtain another accepted certificate for that hostname. Domain/DNS and
+issuance authority must also be independent, including alternate HTTP-01 and
+TLS-ALPN-01 validation routes. Supported CAA account/method restrictions can
+constrain new issuance, but do not invalidate existing certificates. See
+[ACME authorization integrity](https://www.rfc-editor.org/rfc/rfc8555.html#section-10.2)
+and [CAA restrictions](https://letsencrypt.org/docs/caa/).
+
+These are requirements for a stronger authentication boundary, not features of
+today's self-probe. Per-hostname issuance is tracked in
+[#541](https://github.com/gosuda/portal-tunnel/issues/541). Even with independent
+authentication, a relay can disrupt service and observe routing metadata.
 
 ## Relay Visibility
 
