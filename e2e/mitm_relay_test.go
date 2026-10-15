@@ -137,10 +137,8 @@ func (m *mitmIngress) serve(ctx context.Context, raw net.Conn) {
 
 func TestMITMTerminationExcludesRelay(t *testing.T) {
 	h := newHarnessWithName(t, "termination", "127.0.0.1", "terminate", sdk.WithMITMProtection(true))
-	publicURL := h.waitForPublicURL()
-	// The application request starts the self-probe. Exclusion may close
-	// that request before its response arrives; assert the public verdict.
-	_, _ = h.tryGet(publicURL)
+	// No visitor traffic: reverse readiness alone must start the probe and
+	// expose the TLS split through the SDK's public MITM failure verdict.
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
@@ -177,10 +175,10 @@ func TestMITMProbeFailureBudget(t *testing.T) {
 		}
 	}
 	if time.Since(started) >= 30*time.Second {
-		t.Fatal("visitor burst exceeded the cooldown observation window")
+		t.Fatal("visitor burst exceeded the retry interval observation window")
 	}
 	if probes := h.mitm.probeStarts.Load(); probes > 1 {
-		t.Fatalf("failed-probe budget exceeded: %d connections during one cooldown", probes)
+		t.Fatalf("failed-probe budget exceeded: %d connections during one interval", probes)
 	}
 	if statuses := h.exposure.Relays(); len(statuses) != 1 || statuses[0].State != sdk.RelayReady || statuses[0].Failure != "" {
 		t.Fatalf("probe handshake failure must preserve service without a MITM verdict: %+v", statuses)
