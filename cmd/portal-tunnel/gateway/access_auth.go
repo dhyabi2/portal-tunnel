@@ -49,6 +49,15 @@ const (
 	oidcMetadataBodyLimit          = 256 << 10
 )
 
+const (
+	// oidcStateTokenLimit keeps the signed state cookie well under the roughly
+	// 4 KB a browser accepts, since it silently drops a larger one.
+	oidcStateTokenLimit = 3500
+	// oidcMinSessionTTL is the shortest OIDC session, so a short-lived ID token
+	// cannot produce a session that has already expired.
+	oidcMinSessionTTL = 15 * time.Minute
+)
+
 var oidcSupportedSignatureAlgorithms = []jose.SignatureAlgorithm{
 	jose.RS256,
 	jose.RS384,
@@ -559,8 +568,10 @@ func (a *applicationAuth) serveLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (o *oidcAuthenticator) serveLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
+	// A login keeps its state in one cookie, so a request that never completes
+	// the login, like a HEAD probe, must not overwrite the state of one in progress.
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -581,14 +592,21 @@ func (o *oidcAuthenticator) serveLogin(w http.ResponseWriter, r *http.Request) {
 	expiresAt := now.Add(applicationAuthOIDCStateTTL)
 	next := sanitizeApplicationAuthNext(r.URL.Query().Get("next"))
 
-	stateToken, err := encodeSignedApplicationAuthJSON(o.stateKey, oidcStateClaims{
+	stateClaims := oidcStateClaims{
 		State:        state,
 		Nonce:        nonce,
 		CodeVerifier: codeVerifier,
 		Host:         host,
 		Next:         next,
 		ExpiresAt:    expiresAt.Unix(),
-	})
+	}
+	stateToken, err := encodeSignedApplicationAuthJSON(o.stateKey, stateClaims)
+	if err == nil && len(stateToken) > oidcStateTokenLimit {
+		// A deep link too long for the cookie would fail the login at the
+		// callback; the visitor lands on / instead.
+		stateClaims.Next = "/"
+		stateToken, err = encodeSignedApplicationAuthJSON(o.stateKey, stateClaims)
+	}
 	if err != nil {
 		http.Error(w, "could not create login state", http.StatusInternalServerError)
 		return
@@ -675,13 +693,13 @@ func (a *applicationAuth) serveOIDCCallback(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	expiresAt := now.Add(applicationAuthSessionTTL)
-	if claims.Expiry != nil {
-		if tokenExpiry := claims.Expiry.Time(); tokenExpiry.Before(expiresAt) {
-			expiresAt = tokenExpiry
-		}
-	}
-	if err := a.setSession(w, subject, ApplicationAuthProviderOIDC, strings.TrimSpace(r.Host), now, expiresAt); err != nil {
+	// The session follows the ID token's lifetime, within oidcMinSessionTTL and
+	// applicationAuthSessionTTL: a token already inside the verification leeway
+	// would otherwise give a session that is invalid on arrival, and the visitor
+	// would loop through the provider. The allowlist is checked on every request,
+	// so revoking a principal does not wait for the session to end.
+	lifetime := min(max(claims.Expiry.Time().Sub(now), oidcMinSessionTTL), applicationAuthSessionTTL)
+	if err := a.setSession(w, subject, ApplicationAuthProviderOIDC, strings.TrimSpace(r.Host), now, now.Add(lifetime)); err != nil {
 		a.writeJSONError(w, http.StatusInternalServerError, "could not create session")
 		return
 	}
