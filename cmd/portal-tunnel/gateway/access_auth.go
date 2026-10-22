@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/siweauth"
 	"github.com/gosuda/portal-tunnel/v2/portal/identity"
@@ -41,7 +43,9 @@ const (
 	applicationAuthOIDCStateTTL    = 10 * time.Minute
 	applicationAuthBodyLimit       = 64 << 10
 	oidcDiscoveryCacheTTL          = 15 * time.Minute
+	oidcJWKSRefreshInterval        = time.Minute
 	oidcHTTPTimeout                = 10 * time.Second
+	oidcMaxRedirects               = 3
 	oidcMetadataBodyLimit          = 256 << 10
 )
 
@@ -145,10 +149,11 @@ type applicationAuthRedeemRequest struct {
 }
 
 type oidcDiscoveryDocument struct {
-	Issuer                string `json:"issuer"`
-	AuthorizationEndpoint string `json:"authorization_endpoint"`
-	TokenEndpoint         string `json:"token_endpoint"`
-	JWKSURI               string `json:"jwks_uri"`
+	Issuer                   string   `json:"issuer"`
+	AuthorizationEndpoint    string   `json:"authorization_endpoint"`
+	TokenEndpoint            string   `json:"token_endpoint"`
+	JWKSURI                  string   `json:"jwks_uri"`
+	TokenEndpointAuthMethods []string `json:"token_endpoint_auth_methods_supported"`
 }
 
 type oidcStateClaims struct {
@@ -162,9 +167,20 @@ type oidcStateClaims struct {
 
 type oidcIDTokenClaims struct {
 	jwt.Claims
-	Nonce         string `json:"nonce,omitempty"`
-	Email         string `json:"email,omitempty"`
-	EmailVerified *bool  `json:"email_verified,omitempty"`
+	Nonce         string            `json:"nonce,omitempty"`
+	Email         string            `json:"email,omitempty"`
+	EmailVerified oidcEmailVerified `json:"email_verified"`
+}
+
+// oidcEmailVerified decodes the email_verified claim. OIDC defines a JSON
+// boolean, but some providers send the string "true". Only true and "true"
+// count as verified; any other value, or none, decodes as not verified instead
+// of failing the whole claims decode, which would also lock out sub: allowlists.
+type oidcEmailVerified bool
+
+func (v *oidcEmailVerified) UnmarshalJSON(data []byte) error {
+	*v = string(data) == "true" || string(data) == `"true"`
+	return nil
 }
 
 type oidcAuthenticator struct {
@@ -177,10 +193,19 @@ type oidcAuthenticator struct {
 	stateKey   []byte
 	httpClient *http.Client
 
-	mu          sync.Mutex
-	discovery   oidcDiscoveryDocument
-	jwks        jose.JSONWebKeySet
-	refreshedAt time.Time
+	discovery oidcCache[oidcDiscoveryDocument]
+	jwks      oidcCache[jose.JSONWebKeySet]
+}
+
+// oidcCache holds one value fetched from the provider: the discovery document
+// or the signing keys. mu guards only the cached value and is never held
+// across network I/O.
+type oidcCache[T any] struct {
+	flight singleflight.Group
+
+	mu        sync.Mutex
+	value     T
+	fetchedAt time.Time
 }
 
 func newOIDCAuthenticator(cfg ApplicationAuthConfig, stateKey []byte) (*oidcAuthenticator, error) {
@@ -200,7 +225,7 @@ func newOIDCAuthenticator(cfg ApplicationAuthConfig, stateKey []byte) (*oidcAuth
 		clientSecret: strings.TrimSpace(cfg.OIDCClientSecret),
 		binding:      base64.RawURLEncoding.EncodeToString(binding[:]),
 		stateKey:     stateKey,
-		httpClient:   utils.NewHTTPClient(utils.WithHTTPTimeout(oidcHTTPTimeout)),
+		httpClient:   utils.NewHTTPClient(utils.WithHTTPTimeout(oidcHTTPTimeout), utils.WithHTTPCheckRedirect(checkOIDCRedirect)),
 	}, nil
 }
 
@@ -213,11 +238,51 @@ func normalizeOIDCIssuerURL(raw string) (string, error) {
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", errors.New("oidc issuer url must be a valid URL without query or fragment")
 	}
-	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "https" && (scheme != "http" || !isLoopbackHost(parsed.Hostname())) {
+	if parsed.Scheme != "https" && !isLoopbackHTTP(parsed) {
 		return "", errors.New("oidc issuer url must use https (or http on a loopback host)")
 	}
 	return strings.TrimRight(raw, "/"), nil
+}
+
+// isLoopbackHTTP reports whether u is plain http on a loopback host, the one
+// cleartext form OIDC accepts (local development and tests).
+func isLoopbackHTTP(u *url.URL) bool {
+	return u.Scheme == "http" && isLoopbackHost(u.Hostname())
+}
+
+// validateOIDCEndpoint checks an endpoint from the discovery document of
+// issuerURL. Unlike an issuer identifier it may carry a query (RFC 6749
+// sections 3.1/3.2). The token endpoint receives the authorization code, PKCE
+// verifier and client secret, so an endpoint must be https unless the issuer
+// itself is loopback http.
+func validateOIDCEndpoint(issuerURL, endpoint string) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return fmt.Errorf("invalid oidc discovery endpoint %q", endpoint)
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if issuer, err := url.Parse(issuerURL); err == nil && isLoopbackHTTP(issuer) && isLoopbackHTTP(parsed) {
+		return nil
+	}
+	return fmt.Errorf("oidc discovery endpoint must use https (http on a loopback host only under a loopback http issuer): %q", endpoint)
+}
+
+// checkOIDCRedirect keeps a provider from redirecting the gateway's requests
+// to cleartext or through a long chain. Like an endpoint, a redirect target
+// must be https, or loopback http when the chain is already plain http.
+func checkOIDCRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= oidcMaxRedirects {
+		return errors.New("oidc provider redirected too many times")
+	}
+	if req.URL.Scheme == "https" {
+		return nil
+	}
+	if previous := via[len(via)-1].URL; previous.Scheme == "http" && isLoopbackHTTP(req.URL) {
+		return nil
+	}
+	return fmt.Errorf("oidc provider redirected to a non-https url: %s", req.URL.Redacted())
 }
 
 // NormalizeApplicationAuthOIDCPrincipals canonicalizes OIDC allowed principals
@@ -499,7 +564,7 @@ func (o *oidcAuthenticator) serveLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	doc, _, err := o.metadata(r.Context(), false)
+	doc, err := o.discoveryDocument(r.Context())
 	if err != nil {
 		http.Error(w, "oidc discovery failed", http.StatusBadGateway)
 		return
@@ -630,7 +695,7 @@ func (a *applicationAuth) serveOIDCCallback(w http.ResponseWriter, r *http.Reque
 // sub-matched session subject keeps the sub: prefix so the two principal
 // types stay unambiguous on session revalidation and identity headers.
 func (a *applicationAuth) resolveAllowedOIDCSubject(claims oidcIDTokenClaims) (string, bool) {
-	if claims.EmailVerified != nil && *claims.EmailVerified {
+	if claims.EmailVerified {
 		// An email claim shaped like a sub: entry would satisfy that entry
 		// through the exact lookup; it is not an email address.
 		email := oidcClaimPrincipal(claims.Email)
@@ -652,20 +717,38 @@ func (a *applicationAuth) resolveAllowedOIDCSubject(claims oidcIDTokenClaims) (s
 }
 
 func (o *oidcAuthenticator) oauth2Config(doc oidcDiscoveryDocument, host string) oauth2.Config {
+	// The auth style is named because the oauth2 default probes: it sends the
+	// one-time authorization code with the credentials in the Authorization
+	// header and, on any error, sends the same code again with them in the body.
+	authStyle := oauth2.AuthStyleInHeader // client_secret_basic, the OIDC default
+	methods := doc.TokenEndpointAuthMethods
+	switch {
+	case o.clientSecret == "":
+		authStyle = oauth2.AuthStyleInParams
+	case slices.Contains(methods, "client_secret_post") && !slices.Contains(methods, "client_secret_basic"):
+		authStyle = oauth2.AuthStyleInParams
+	}
 	return oauth2.Config{
 		ClientID:     o.clientID,
 		ClientSecret: o.clientSecret,
 		RedirectURL:  "https://" + host + applicationAuthCallbackPath,
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  doc.AuthorizationEndpoint,
-			TokenURL: doc.TokenEndpoint,
+			AuthURL:   doc.AuthorizationEndpoint,
+			TokenURL:  doc.TokenEndpoint,
+			AuthStyle: authStyle,
 		},
 		Scopes: []string{"openid", "email", "profile"},
 	}
 }
 
 func (o *oidcAuthenticator) exchangeAndVerify(ctx context.Context, code string, state oidcStateClaims, now time.Time) (oidcIDTokenClaims, error) {
-	doc, jwks, err := o.metadata(ctx, false)
+	doc, err := o.discoveryDocument(ctx)
+	if err != nil {
+		return oidcIDTokenClaims{}, err
+	}
+	// Load the keys before the exchange so an unreachable JWKS does not burn
+	// the one-time authorization code.
+	jwks, err := o.jwks.get(ctx, oidcDiscoveryCacheTTL, o.fetchJWKS)
 	if err != nil {
 		return oidcIDTokenClaims{}, err
 	}
@@ -681,17 +764,17 @@ func (o *oidcAuthenticator) exchangeAndVerify(ctx context.Context, code string, 
 	}
 
 	claims, err := o.verifyIDToken(rawIDToken, state.Nonce, doc.Issuer, jwks, now)
-	if err != nil {
-		doc, jwks, refreshErr := o.metadata(ctx, true)
-		if refreshErr != nil {
-			return oidcIDTokenClaims{}, err
-		}
-		claims, err = o.verifyIDToken(rawIDToken, state.Nonce, doc.Issuer, jwks, now)
-		if err != nil {
-			return oidcIDTokenClaims{}, err
-		}
+	if !errors.Is(err, jose.ErrJWKSKidNotFound) && !errors.Is(err, jose.ErrCryptoFailure) {
+		return claims, err
 	}
-	return claims, nil
+	// Only a key error can be fixed by new keys: the provider may have rotated
+	// since the cached set was fetched. The cache serves the same set again
+	// when it was fetched less than oidcJWKSRefreshInterval ago.
+	jwks, refreshErr := o.jwks.get(ctx, oidcJWKSRefreshInterval, o.fetchJWKS)
+	if refreshErr != nil {
+		return oidcIDTokenClaims{}, err
+	}
+	return o.verifyIDToken(rawIDToken, state.Nonce, doc.Issuer, jwks, now)
 }
 
 func (o *oidcAuthenticator) verifyIDToken(rawToken, expectedNonce, issuer string, jwks jose.JSONWebKeySet, now time.Time) (oidcIDTokenClaims, error) {
@@ -700,7 +783,7 @@ func (o *oidcAuthenticator) verifyIDToken(rawToken, expectedNonce, issuer string
 		return oidcIDTokenClaims{}, err
 	}
 	var claims oidcIDTokenClaims
-	if err := parsed.Claims(&jwks, &claims); err != nil {
+	if err := parsed.Claims(oidcVerificationKey(parsed.Headers, &jwks), &claims); err != nil {
 		return oidcIDTokenClaims{}, err
 	}
 	if claims.Expiry == nil {
@@ -722,54 +805,104 @@ func (o *oidcAuthenticator) verifyIDToken(rawToken, expectedNonce, issuer string
 	return claims, nil
 }
 
-func (o *oidcAuthenticator) metadata(ctx context.Context, forceRefresh bool) (oidcDiscoveryDocument, jose.JSONWebKeySet, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if !forceRefresh && !o.refreshedAt.IsZero() && time.Since(o.refreshedAt) < oidcDiscoveryCacheTTL {
-		return o.discovery, o.jwks, nil
+// oidcVerificationKey selects what a token is verified against. go-jose finds
+// a key in a set by the token's kid and refuses a token without one, even when
+// the set holds a single key. A provider that signs with one key may omit the
+// kid, so that key, when it is a signing key, is used directly.
+func oidcVerificationKey(headers []jose.Header, jwks *jose.JSONWebKeySet) any {
+	if len(headers) != 1 || headers[0].KeyID != "" || len(jwks.Keys) != 1 {
+		return jwks
 	}
+	if use := jwks.Keys[0].Use; use != "" && use != "sig" {
+		return jwks
+	}
+	return jwks.Keys[0]
+}
 
+// get returns the cached value while it is younger than maxAge and otherwise
+// refreshes it. Concurrent callers join one shared fetch instead of queueing
+// behind a lock or fetching again, and each stops waiting when its own ctx
+// ends. The fetch is detached from the first caller's cancellation so one
+// abandoned login does not fail the others; the HTTP client timeout bounds it.
+func (c *oidcCache[T]) get(ctx context.Context, maxAge time.Duration, fetch func(context.Context) (T, error)) (T, error) {
+	if value, ok := c.fresh(maxAge); ok {
+		return value, nil
+	}
+	result := c.flight.DoChan("", func() (any, error) {
+		// A caller can join just after the previous fetch finished.
+		if value, ok := c.fresh(maxAge); ok {
+			return value, nil
+		}
+		value, err := fetch(context.WithoutCancel(ctx))
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.value, c.fetchedAt = value, time.Now()
+		c.mu.Unlock()
+		return value, nil
+	})
+	var zero T
+	select {
+	case res := <-result:
+		if res.Err != nil {
+			return zero, res.Err
+		}
+		return res.Val.(T), nil
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	}
+}
+
+func (c *oidcCache[T]) fresh(maxAge time.Duration) (T, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value, !c.fetchedAt.IsZero() && time.Since(c.fetchedAt) < maxAge
+}
+
+// discoveryDocument is all that starting a login needs. The signing keys are
+// fetched separately, and only to verify a token.
+func (o *oidcAuthenticator) discoveryDocument(ctx context.Context) (oidcDiscoveryDocument, error) {
+	return o.discovery.get(ctx, oidcDiscoveryCacheTTL, o.fetchDiscovery)
+}
+
+func (o *oidcAuthenticator) fetchDiscovery(ctx context.Context) (oidcDiscoveryDocument, error) {
 	discoveryURL := o.issuerURL + "/.well-known/openid-configuration"
 	var doc oidcDiscoveryDocument
 	if err := fetchOIDCJSON(ctx, o.httpClient, discoveryURL, &doc); err != nil {
-		return oidcDiscoveryDocument{}, jose.JSONWebKeySet{}, fmt.Errorf("fetch oidc discovery: %w", err)
+		return oidcDiscoveryDocument{}, fmt.Errorf("fetch oidc discovery: %w", err)
 	}
 	doc.Issuer = strings.TrimSpace(doc.Issuer)
 	doc.AuthorizationEndpoint = strings.TrimSpace(doc.AuthorizationEndpoint)
 	doc.TokenEndpoint = strings.TrimSpace(doc.TokenEndpoint)
 	doc.JWKSURI = strings.TrimSpace(doc.JWKSURI)
 	if doc.Issuer == "" || doc.AuthorizationEndpoint == "" || doc.TokenEndpoint == "" || doc.JWKSURI == "" {
-		return oidcDiscoveryDocument{}, jose.JSONWebKeySet{}, errors.New("incomplete oidc discovery document")
+		return oidcDiscoveryDocument{}, errors.New("incomplete oidc discovery document")
 	}
 	if strings.TrimRight(doc.Issuer, "/") != o.issuerURL {
-		return oidcDiscoveryDocument{}, jose.JSONWebKeySet{}, errors.New("oidc discovery issuer mismatch")
+		return oidcDiscoveryDocument{}, errors.New("oidc discovery issuer mismatch")
 	}
 	for _, endpoint := range []string{doc.AuthorizationEndpoint, doc.TokenEndpoint, doc.JWKSURI} {
-		// OAuth endpoints may contain queries (RFC 6749 sections 3.1/3.2),
-		// unlike issuer identifiers. Keep them intact for the actual requests.
-		parsed, err := url.Parse(endpoint)
-		if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-			return oidcDiscoveryDocument{}, jose.JSONWebKeySet{}, fmt.Errorf("invalid oidc discovery endpoint %q", endpoint)
-		}
-		scheme := strings.ToLower(parsed.Scheme)
-		if scheme != "https" && (scheme != "http" || !isLoopbackHost(parsed.Hostname())) {
-			return oidcDiscoveryDocument{}, jose.JSONWebKeySet{}, fmt.Errorf("oidc discovery endpoint must use https (or http on a loopback host): %q", endpoint)
+		if err := validateOIDCEndpoint(o.issuerURL, endpoint); err != nil {
+			return oidcDiscoveryDocument{}, err
 		}
 	}
+	return doc, nil
+}
 
+func (o *oidcAuthenticator) fetchJWKS(ctx context.Context) (jose.JSONWebKeySet, error) {
+	doc, err := o.discoveryDocument(ctx)
+	if err != nil {
+		return jose.JSONWebKeySet{}, err
+	}
 	var jwks jose.JSONWebKeySet
 	if err := fetchOIDCJSON(ctx, o.httpClient, doc.JWKSURI, &jwks); err != nil {
-		return oidcDiscoveryDocument{}, jose.JSONWebKeySet{}, fmt.Errorf("fetch oidc jwks: %w", err)
+		return jose.JSONWebKeySet{}, fmt.Errorf("fetch oidc jwks: %w", err)
 	}
 	if len(jwks.Keys) == 0 {
-		return oidcDiscoveryDocument{}, jose.JSONWebKeySet{}, errors.New("oidc jwks contains no keys")
+		return jose.JSONWebKeySet{}, errors.New("oidc jwks contains no keys")
 	}
-
-	o.discovery = doc
-	o.jwks = jwks
-	o.refreshedAt = time.Now().UTC()
-	return o.discovery, o.jwks, nil
+	return jwks, nil
 }
 
 func fetchOIDCJSON(ctx context.Context, client *http.Client, targetURL string, dst any) error {
