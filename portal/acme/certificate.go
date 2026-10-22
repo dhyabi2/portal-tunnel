@@ -18,13 +18,24 @@ import (
 	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
+	"github.com/go-acme/lego/v4/certificate"
 	lego "github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
+	"github.com/rs/zerolog/log"
 
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
 
-const localDevelopmentCertificateTTL = 3650 * 24 * time.Hour
+const (
+	localDevelopmentCertificateTTL = 3650 * 24 * time.Hour
+	defaultRenewThreshold          = 30 * 24 * time.Hour
+	// maxRenewExpiryFloor bounds how long ARI may defer renewal: a certificate
+	// with less lifetime left is renewed whatever the CA suggests.
+	maxRenewExpiryFloor = 7 * 24 * time.Hour
+	// minARIRecheckDelay keeps a CA's Retry-After from driving the renewal
+	// check faster than hourly.
+	minARIRecheckDelay = time.Hour
+)
 
 type acmeUser struct {
 	Key          crypto.PrivateKey
@@ -32,25 +43,79 @@ type acmeUser struct {
 	Email        string
 }
 
-func (m *Manager) shouldRenew() bool {
+// shouldRenew reports whether the certificate on disk should be renewed now,
+// the RFC 9773 ReplacesCertID to renew it with, and how long the maintenance
+// loop should wait before checking again.
+func (m *Manager) shouldRenew(ctx context.Context) (bool, string, time.Duration) {
 	certFile := filepath.Join(m.cfg.KeyDir, fullChainFileName)
-	needsRenewal, err := certNeedsRenewal(certFile, certificateDomains(m.cfg.BaseDomain))
-	return err == nil && needsRenewal
+	cert, err := loadCertificate(certFile)
+	if err != nil {
+		return false, "", defaultRenewInterval
+	}
+	domains := certificateDomains(m.cfg.BaseDomain)
+	now := time.Now().UTC()
+	var ari *certificate.RenewalInfoResponse
+	// A certificate that no longer covers the domains or has already expired
+	// is replaced without consulting ARI.
+	if certificateCoversDomains(cert, domains) && now.Before(cert.NotAfter) {
+		client, clientErr := m.newClient(ctx)
+		if clientErr == nil {
+			ari, clientErr = client.Certificate.GetRenewalInfo(certificate.RenewalInfoRequest{Cert: cert})
+		}
+		if clientErr != nil {
+			log.Debug().Err(clientErr).Str("base_domain", m.cfg.BaseDomain).Msg("acme renewal information unavailable")
+		}
+	}
+	return evaluateRenewal(cert, domains, ari, now)
 }
 
 func certificateDomains(baseDomain string) []string {
 	return []string{baseDomain, "*." + baseDomain}
 }
 
-func certNeedsRenewal(certFile string, domains []string) (bool, error) {
-	cert, err := loadCertificate(certFile)
-	if err != nil {
-		return false, err
+// evaluateRenewal decides whether cert should be renewed now. It returns the
+// RFC 9773 ReplacesCertID when the CA's ARI response guided the renewal, and
+// the delay before the next check.
+//
+// ARI schedules renewals only while cert is unexpired and covers domains and
+// the CA returned a usable window; otherwise the 30-day remaining-lifetime
+// threshold applies. ARI never defers renewal past the expiry floor.
+func evaluateRenewal(cert *x509.Certificate, domains []string, ari *certificate.RenewalInfoResponse, now time.Time) (renew bool, replacesCertID string, recheck time.Duration) {
+	recheck = defaultRenewInterval
+	if cert == nil {
+		return false, "", recheck
 	}
-	if time.Until(cert.NotAfter) < 30*24*time.Hour {
-		return true, nil
+	remaining := cert.NotAfter.Sub(now)
+	if !certificateCoversDomains(cert, domains) || remaining <= 0 {
+		return true, "", recheck
 	}
-	return !certificateCoversDomains(cert, domains), nil
+	if ari == nil || ari.SuggestedWindow.Start.IsZero() || !ari.SuggestedWindow.End.After(ari.SuggestedWindow.Start) {
+		return remaining < defaultRenewThreshold, "", recheck
+	}
+
+	// MakeARICertID fails only for certificates without an authority key id;
+	// those still renew, just without naming the certificate they replace.
+	certID, _ := certificate.MakeARICertID(cert)
+	if ari.RetryAfter > 0 {
+		recheck = min(max(ari.RetryAfter, minARIRecheckDelay), defaultRenewInterval)
+	}
+	floor := renewExpiryFloor(cert)
+	// ShouldRenewAt returns nil only when the time it picked in the window
+	// falls after the next check; anything else is due before then, so
+	// renew now (RFC 9773, section 4.1).
+	if remaining < floor || ari.ShouldRenewAt(now, recheck) != nil {
+		return true, certID, recheck
+	}
+	return false, "", min(recheck, remaining-floor)
+}
+
+// renewExpiryFloor is the remaining lifetime below which cert is renewed
+// regardless of ARI: a tenth of its lifetime, at most maxRenewExpiryFloor.
+func renewExpiryFloor(cert *x509.Certificate) time.Duration {
+	if lifetime := cert.NotAfter.Sub(cert.NotBefore); lifetime > 0 {
+		return min(maxRenewExpiryFloor, lifetime/10)
+	}
+	return maxRenewExpiryFloor
 }
 
 func certCoversDomains(certFile string, domains []string) (bool, error) {
@@ -81,7 +146,11 @@ func certificateCoversDomains(cert *x509.Certificate, domains []string) bool {
 	return true
 }
 
-func newClient(ctx context.Context, email, accountKeyFile, registrationFile string, dnsProvider DNSProvider) (*lego.Client, error) {
+func (m *Manager) newClient(ctx context.Context) (*lego.Client, error) {
+	email := defaultACMEEmailPrefix + m.cfg.BaseDomain
+	accountKeyFile := filepath.Join(m.cfg.KeyDir, accountKeyFileName)
+	registrationFile := filepath.Join(m.cfg.KeyDir, registrationFileName)
+	dnsProvider := m.dns
 	accountKey, err := loadOrCreateAccountKey(accountKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load acme account key: %w", err)
