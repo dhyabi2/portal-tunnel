@@ -120,6 +120,8 @@ type applicationAuthClaims struct {
 	Provider  string `json:"auth,omitempty"`
 	Host      string `json:"host"`
 	ExpiresAt int64  `json:"exp"`
+	// Binding names the OIDC issuer and client that authenticated the visitor.
+	Binding string `json:"bnd,omitempty"`
 }
 
 type applicationAuthChallengeRequest struct {
@@ -169,8 +171,11 @@ type oidcAuthenticator struct {
 	issuerURL    string
 	clientID     string
 	clientSecret string
-	stateKey     []byte
-	httpClient   *http.Client
+	// binding digests the issuer and client ID into every OIDC session, since a
+	// subject only means something at the issuer and client that produced it.
+	binding    string
+	stateKey   []byte
+	httpClient *http.Client
 
 	mu          sync.Mutex
 	discovery   oidcDiscoveryDocument
@@ -187,10 +192,13 @@ func newOIDCAuthenticator(cfg ApplicationAuthConfig, stateKey []byte) (*oidcAuth
 	if clientID == "" {
 		return nil, errors.New("oidc client id is required")
 	}
+	// A parsed issuer URL cannot hold a NUL, so the separator keeps the pair unambiguous.
+	binding := sha256.Sum256([]byte(issuerURL + "\x00" + clientID))
 	return &oidcAuthenticator{
 		issuerURL:    issuerURL,
 		clientID:     clientID,
 		clientSecret: strings.TrimSpace(cfg.OIDCClientSecret),
+		binding:      base64.RawURLEncoding.EncodeToString(binding[:]),
 		stateKey:     stateKey,
 		httpClient:   utils.NewHTTPClient(utils.WithHTTPTimeout(oidcHTTPTimeout)),
 	}, nil
@@ -926,6 +934,9 @@ func (a *applicationAuth) authenticateSession(r *http.Request) (string, string, 
 	}
 	var subject string
 	if provider == ApplicationAuthProviderOIDC {
+		if a.oidc == nil || claims.Binding != a.oidc.binding {
+			return "", "", false
+		}
 		subject, err = normalizeOIDCPrincipal(claims.Subject)
 	} else {
 		subject, err = normalizeApplicationAuthSubject(claims.Subject)
@@ -966,7 +977,11 @@ func (a *applicationAuth) subjectAllowed(subject string) bool {
 }
 
 func (a *applicationAuth) issueSession(subject, provider, host string, expiresAt time.Time) (string, error) {
-	return encodeSignedApplicationAuthJSON(a.signingKey, applicationAuthClaims{Subject: subject, Provider: provider, Host: host, ExpiresAt: expiresAt.Unix()})
+	claims := applicationAuthClaims{Subject: subject, Provider: provider, Host: host, ExpiresAt: expiresAt.Unix()}
+	if provider == ApplicationAuthProviderOIDC {
+		claims.Binding = a.oidc.binding
+	}
+	return encodeSignedApplicationAuthJSON(a.signingKey, claims)
 }
 
 func (a *applicationAuth) setSession(w http.ResponseWriter, subject, provider, host string, now, expiresAt time.Time) error {

@@ -756,3 +756,78 @@ func TestApplicationAuthOIDCLongSubSurvivesRevalidation(t *testing.T) {
 		t.Fatalf("authenticateSession = (%q, %v); want the session to stay valid for %q", got, ok, subject)
 	}
 }
+
+// A subject only means something at the issuer and client that produced it, so
+// a session must not outlive a change of either, while a restart with the same
+// configuration keeps it.
+func TestApplicationAuthOIDCSessionIsBoundToIssuerAndClient(t *testing.T) {
+	t.Parallel()
+
+	newGate := func(t *testing.T, issuer, clientID, clientSecret string) *applicationAuth {
+		t.Helper()
+		handler, err := NewApplicationAuth(http.NotFoundHandler(), applicationAuthTestIdentity(), ApplicationAuthConfig{
+			Provider:         ApplicationAuthProviderOIDC,
+			AllowedWallets:   []string{"alice@example.com"},
+			OIDCIssuerURL:    issuer,
+			OIDCClientID:     clientID,
+			OIDCClientSecret: clientSecret,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return handler.(*applicationAuth)
+	}
+	sessionRequest := func(cookies []*http.Cookie) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "https://app.example/dashboard", nil)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		return req
+	}
+
+	issuer := newGate(t, "https://idp.example", "portal-client", "secret")
+	rec := httptest.NewRecorder()
+	if err := issuer.setSession(rec, "alice@example.com", ApplicationAuthProviderOIDC, "app.example", time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cookies := rec.Result().Cookies()
+
+	for _, tt := range []struct {
+		name         string
+		issuer       string
+		clientID     string
+		clientSecret string
+		want         bool
+	}{
+		{"same configuration after a restart", "https://idp.example", "portal-client", "secret", true},
+		{"issuer written with a trailing slash", "https://idp.example/", "portal-client", "secret", true},
+		{"rotated client secret", "https://idp.example", "portal-client", "rotated", true},
+		{"different issuer", "https://other-idp.example", "portal-client", "secret", false},
+		{"different client id", "https://idp.example", "other-client", "secret", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gate := newGate(t, tt.issuer, tt.clientID, tt.clientSecret)
+			if _, _, ok := gate.authenticateSession(sessionRequest(cookies)); ok != tt.want {
+				t.Fatalf("authenticateSession ok = %v; want %v", ok, tt.want)
+			}
+		})
+	}
+
+	t.Run("session carrying no binding", func(t *testing.T) {
+		t.Parallel()
+		token, err := encodeSignedApplicationAuthJSON(issuer.signingKey, applicationAuthClaims{
+			Subject:   "alice@example.com",
+			Provider:  ApplicationAuthProviderOIDC,
+			Host:      "app.example",
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cookie := &http.Cookie{Name: applicationAuthCookieName, Value: token}
+		if _, _, ok := issuer.authenticateSession(sessionRequest([]*http.Cookie{cookie})); ok {
+			t.Fatal("an OIDC session without an issuer and client binding was accepted")
+		}
+	})
+}
