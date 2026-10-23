@@ -27,6 +27,7 @@ const (
 type Config struct {
 	BaseDomain         string
 	KeyDir             string
+	CADirURL           string
 	DNSProvider        string
 	ENSGaslessEnabled  bool
 	ENSGaslessAddress  string
@@ -66,6 +67,11 @@ type Manager struct {
 func NewManager(cfg Config) (*Manager, error) {
 	cfg.BaseDomain = utils.NormalizeBaseDomain(cfg.BaseDomain)
 	cfg.KeyDir = strings.TrimSpace(cfg.KeyDir)
+	caDirURL, err := NormalizeCADirURL(cfg.CADirURL)
+	if err != nil {
+		return nil, err
+	}
+	cfg.CADirURL = caDirURL
 	cfg.DNSProvider = strings.ToLower(strings.TrimSpace(cfg.DNSProvider))
 	if cfg.DNSProvider == "" {
 		cfg.DNSProvider = TypeEmbedded
@@ -227,8 +233,7 @@ func (m *Manager) TLSFiles() (string, string, error) {
 	if m == nil {
 		return "", "", errors.New("acme manager is nil")
 	}
-	certFile := filepath.Join(m.cfg.KeyDir, fullChainFileName)
-	keyFile := filepath.Join(m.cfg.KeyDir, keyFileName)
+	certFile, keyFile := m.certificateFiles()
 	if !utils.FileExists(certFile) || !utils.FileExists(keyFile) {
 		return "", "", errors.New("relay certificate files do not exist")
 	}
@@ -248,6 +253,8 @@ func (m *Manager) manualCertificateOverride() (string, string, bool, error) {
 	if err != nil {
 		return "", "", false, fmt.Errorf("validate relay certificate: %w", err)
 	}
+	// The account key is created before any registration, so it marks ACME state
+	// for every CA directory, whatever name that directory's registration has.
 	hasACMEState := utils.FileExists(filepath.Join(m.cfg.KeyDir, accountKeyFileName)) || utils.FileExists(filepath.Join(m.cfg.KeyDir, registrationFileName))
 	if !covered {
 		if !hasACMEState {
@@ -262,13 +269,11 @@ func (m *Manager) manualCertificateOverride() (string, string, bool, error) {
 }
 
 func (m *Manager) provision(ctx context.Context, replacesCertID string) error {
-	keyFile := filepath.Join(m.cfg.KeyDir, keyFileName)
-	certFile := filepath.Join(m.cfg.KeyDir, fullChainFileName)
+	certFile, keyFile := m.certificateFiles()
 	accountKeyFile := filepath.Join(m.cfg.KeyDir, accountKeyFileName)
-	registrationFile := filepath.Join(m.cfg.KeyDir, registrationFileName)
 	domains := certificateDomains(m.cfg.BaseDomain)
 
-	for _, path := range []string{keyFile, certFile, accountKeyFile, registrationFile} {
+	for _, path := range []string{keyFile, certFile, accountKeyFile} {
 		if err := utils.EnsureParentDir(path); err != nil {
 			return err
 		}

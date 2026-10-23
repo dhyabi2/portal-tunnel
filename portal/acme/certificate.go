@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -13,8 +14,10 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
@@ -47,7 +50,7 @@ type acmeUser struct {
 // the RFC 9773 ReplacesCertID to renew it with, and how long the maintenance
 // loop should wait before checking again.
 func (m *Manager) shouldRenew(ctx context.Context) (bool, string, time.Duration) {
-	certFile := filepath.Join(m.cfg.KeyDir, fullChainFileName)
+	certFile, _ := m.certificateFiles()
 	cert, err := loadCertificate(certFile)
 	if err != nil {
 		return false, "", defaultRenewInterval
@@ -146,10 +149,71 @@ func certificateCoversDomains(cert *x509.Certificate, domains []string) bool {
 	return true
 }
 
+// NormalizeCADirURL validates an optional ACME CA directory URL and defaults
+// an empty value to Let's Encrypt production. ACME requires HTTPS (RFC 8555)
+// and lego refuses any other scheme, so no other URL can work, loopback or not.
+func NormalizeCADirURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return lego.LEDirectoryProduction, nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("acme ca directory url must be a valid URL without credentials, query, or fragment")
+	}
+	if parsed.Scheme != "https" {
+		return "", errors.New("acme ca directory url must use https")
+	}
+	// The scheme and host are case-insensitive, and the files of a CA are named
+	// after this string, so two spellings of one directory must not look like two CAs.
+	parsed.Host = strings.ToLower(parsed.Host)
+	return parsed.String(), nil
+}
+
+// registrationFilePath returns where the account registration for the CA
+// directory is persisted. An account exists only at the CA that created it,
+// and lego signs requests with the stored account URL, so each directory keeps
+// its own file. Let's Encrypt production keeps the legacy name so existing
+// installations keep their registration.
+func registrationFilePath(keyDir, caDirURL string) string {
+	if caDirURL == lego.LEDirectoryProduction {
+		return filepath.Join(keyDir, registrationFileName)
+	}
+	return filepath.Join(keyDir, "acme-registration-"+caDirectoryDigest(caDirURL)+".json")
+}
+
+// certificateFilePaths returns where the certificate chain and private key
+// issued by the CA directory are stored. Only a certificate that the configured
+// CA issued may be served or renewed, so each directory keeps its own pair and
+// changing the CA leaves the others on disk, unused. Let's Encrypt production
+// keeps the legacy names, which also hold operator-supplied certificates.
+func certificateFilePaths(keyDir, caDirURL string) (certFile, keyFile string) {
+	if caDirURL == lego.LEDirectoryProduction {
+		return filepath.Join(keyDir, fullChainFileName), filepath.Join(keyDir, keyFileName)
+	}
+	digest := caDirectoryDigest(caDirURL)
+	return filepath.Join(keyDir, "fullchain-"+digest+".pem"), filepath.Join(keyDir, "privatekey-"+digest+".pem")
+}
+
+// caDirectoryDigest names a CA directory inside file names.
+func caDirectoryDigest(caDirURL string) string {
+	sum := sha256.Sum256([]byte(caDirURL))
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+// certificateFiles returns the certificate files of the configured CA. A local
+// development certificate involves no CA and always uses the legacy names.
+func (m *Manager) certificateFiles() (certFile, keyFile string) {
+	if utils.IsLocalRelayHost(m.cfg.BaseDomain) {
+		return certificateFilePaths(m.cfg.KeyDir, lego.LEDirectoryProduction)
+	}
+	return certificateFilePaths(m.cfg.KeyDir, m.cfg.CADirURL)
+}
+
 func (m *Manager) newClient(ctx context.Context) (*lego.Client, error) {
 	email := defaultACMEEmailPrefix + m.cfg.BaseDomain
 	accountKeyFile := filepath.Join(m.cfg.KeyDir, accountKeyFileName)
-	registrationFile := filepath.Join(m.cfg.KeyDir, registrationFileName)
+	registrationFile := registrationFilePath(m.cfg.KeyDir, m.cfg.CADirURL)
 	dnsProvider := m.dns
 	accountKey, err := loadOrCreateAccountKey(accountKeyFile)
 	if err != nil {
@@ -173,12 +237,18 @@ func (m *Manager) newClient(ctx context.Context) (*lego.Client, error) {
 	}
 
 	clientConfig := lego.NewConfig(user)
-	clientConfig.CADirURL = lego.LEDirectoryProduction
+	clientConfig.CADirURL = m.cfg.CADirURL
 	clientConfig.Certificate.KeyType = certcrypto.RSA2048
 
 	client, err := lego.NewClient(clientConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create acme client: %w", err)
+	}
+	// An account is registered without External Account Binding, which some
+	// CAs (ZeroSSL and Google Trust Services among them) demand, so say so here
+	// instead of failing inside the registration exchange.
+	if user.Registration == nil && client.GetExternalAccountRequired() {
+		return nil, fmt.Errorf("acme directory %s requires external account binding, which is not supported", m.cfg.CADirURL)
 	}
 
 	challengeProvider, err := dnsProvider.ChallengeProvider(ctx)
